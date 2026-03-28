@@ -1,0 +1,9 @@
+#!/bin/sh
+
+set -eu
+
+ruff format --check
+ruff check
+black --check .
+flake8 ppci test tools
+pytest

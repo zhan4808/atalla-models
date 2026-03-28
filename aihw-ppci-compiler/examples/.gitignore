@@ -1,0 +1,7 @@
+
+*.bin
+*.elf
+*.exe
+*.hex
+*.oj
+*report.html

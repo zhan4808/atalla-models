@@ -1,0 +1,31 @@
+
+<project name="snake" default="snake">
+    <import name="ppci.build.buildtasks" />
+
+    <target name="snake">
+        <assemble
+            arch="x86_64"
+            source="../glue.asm"
+            output="glue.oj" />
+
+        <c3compile
+            arch="x86_64"
+            sources="../../src/snake/*.c3;../../../librt/io.c3;../bsp.c3"
+            output="rest.oj"
+            report="report.html"/>
+
+        <link
+            output="snake.oj"
+            layout="../linux64.mmap"
+            debug="true"
+            objects="glue.oj;rest.oj" />
+
+        <objcopy
+            objectfile="snake.oj"
+            imagename="flash"
+            format="elf"
+            output="snake" />
+    </target>
+
+</project>
+

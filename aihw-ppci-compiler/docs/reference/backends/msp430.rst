@@ -1,0 +1,18 @@
+
+.. _msp430:
+
+msp430
+------
+
+Testing
+~~~~~~~
+
+To test the code for msp430, the openmsp430 project is used.
+
+https://opencores.org/project,openmsp430
+
+Module
+~~~~~~
+
+.. automodule:: ppci.arch.msp430
+    :members:

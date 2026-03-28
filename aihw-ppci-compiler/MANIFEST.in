@@ -1,0 +1,7 @@
+recursive-include ppci *.grammar template.js template.html
+recursive-include doc *
+prune doc/_build
+include *.rst
+
+include license.txt
+include readme.rst
