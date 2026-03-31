@@ -245,6 +245,21 @@ def run_pipeline(model: nn.Module, example_input: torch.Tensor,
             except ValueError:
                 pass
 
+        if emission.maxpool_post is not None:
+            pp = emission.maxpool_post
+            raw = result.reshape(pp["C"], pp["H_out"], pp["W"])
+            out = np.empty((pp["C"], pp["H_out"], pp["W_out"]), dtype=np.float32)
+            for c in range(pp["C"]):
+                for oh in range(pp["H_out"]):
+                    for ow in range(pp["W_out"]):
+                        base = ow * pp["stride"]
+                        out[c, oh, ow] = max(
+                            float(raw[c, oh, base + p])
+                            for p in range(pp["pool"])
+                            if base + p < pp["W"]
+                        )
+            result = out.reshape(pp["final_shape"])
+
         activation_cache[node.name] = result
         stats["nodes_emulated"] += 1
 

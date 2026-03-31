@@ -23,13 +23,8 @@ _FUNC_SIM = Path(__file__).resolve().parent.parent.parent / "functional_sim"
 if str(_FUNC_SIM) not in sys.path:
     sys.path.insert(0, str(_FUNC_SIM))
 
-# Default: vendored copy inside atalla-models (master + isa-fixes branch).
-# Override with ATALLA_COMPILER_PATH if you want to point at the sibling repo directly.
 _default_compiler = Path(__file__).resolve().parent.parent.parent / "aihw-ppci-compiler"
 _COMPILER = Path(os.environ.get("ATALLA_COMPILER_PATH", str(_default_compiler)))
-_COMPILER_EMU = _COMPILER / "emulator"
-if str(_COMPILER_EMU) not in sys.path:
-    sys.path.insert(0, str(_COMPILER_EMU))
 
 from build import DRAMWriter, render_testfile
 from build_alexnet_layer import im2col, TILE
@@ -37,9 +32,11 @@ import build_compiler as _bc
 
 from graph.tile_planner import TileConfig
 from graph.fx_capture import get_node_shape
-
-
-ADDR_TABLE = 60
+from kernels import ADDR_TABLE, TILE, sdma_ctl_val, sdma_ctl_expr
+from kernels import gemm_c as _gemm_c
+from kernels import relu_c as _relu_c
+from kernels import softmax_c as _softmax_c
+from kernels import maxpool_c as _maxpool_c
 
 
 def _to_bf16_array(tensor: torch.Tensor) -> np.ndarray:
@@ -56,7 +53,7 @@ def _get_module(gm: GraphModule, target: str):
 
 class LayerEmission:
     __slots__ = ("c_source", "instr_text", "dram", "output_addr", "output_shape",
-                 "output_elements", "skip_emulator", "numpy_result")
+                 "output_elements", "skip_emulator", "numpy_result", "maxpool_post")
 
     def __init__(self):
         self.c_source: str = ""
@@ -67,6 +64,7 @@ class LayerEmission:
         self.output_elements: int = 0
         self.skip_emulator: bool = False
         self.numpy_result: Optional[np.ndarray] = None
+        self.maxpool_post: Optional[dict] = None
 
 
 def _align_data(nbytes: int) -> int:
@@ -99,244 +97,6 @@ def _write_matrix(img: DRAMWriter, base_addr: int, mat: np.ndarray, rows: int, c
 def _write_zeros(img: DRAMWriter, base_addr: int, count: int):
     for i in range(count):
         img.bf16(base_addr + i * 2, 0.0)
-
-
-# ---------------------------------------------------------------------------
-# AtallaC source generators
-# ---------------------------------------------------------------------------
-
-def _sdma_ctl_val(sid: int, num_rows: int, num_cols: int, full_cols: int) -> int:
-    """Pack scratchpad DMA control register value."""
-    return (sid << 30) | ((num_rows - 1) << 25) | ((num_cols - 1) << 20) | (full_cols - 1)
-
-
-def _sdma_ctl_expr(name: str, sid: int, num_rows: int, num_cols: int, full_cols: int) -> str:
-    """Emit C statement that loads a pre-computed sdma_ctl via inline asm li_s.
-
-    The compiler's instruction selector can't handle large constant stores,
-    so we use inline asm to let build_compiler expand li_s -> lui_s+addi_s.
-    """
-    val = _sdma_ctl_val(sid, num_rows, num_cols, full_cols)
-    return f'    int {name};\n    asm("li_s %0, {val}" : "=r"({name}));\n'
-
-
-def _gemm_c(M: int, N: int, K: int) -> str:
-    """Generate AtallaC for tiled GEMM reading config from ADDR_TABLE."""
-    tm1 = min(TILE, M) - 1
-    tn1 = min(TILE, N) - 1
-    tk1 = min(TILE, K) - 1
-    tile_m = min(TILE, M)
-    tile_n = min(TILE, N)
-    tile_k = min(TILE, K)
-    # Input: SP0 (sid=0). Weights: SP1 (sid=1). Output: SP1 (sid=1).
-    # Weights are loaded and preloaded into the systolic array first,
-    # then output is loaded into SP1 (overwriting weight data, but the
-    # systolic array already has the weights).
-    sdma_a_s = _sdma_ctl_expr("sdma_ctl_a", 0, tile_m, tile_k, K)
-    sdma_w_s = _sdma_ctl_expr("sdma_ctl_w", 1, tile_k, tile_n, N)
-    sdma_c_s = _sdma_ctl_expr("sdma_ctl_c", 1, tile_m, tile_n, N)
-
-    return (
-        "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int A_GMEM; int W_GMEM; int C_GMEM;\n"
-        "    int gM; int gN; int gK;\n"
-        "    int M_tiles; int N_tiles; int K_tiles; int tile_sz;\n"
-        "\n"
-        '    asm("lw_s %0, 0(%1)"  : "=r"(A_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)"  : "=r"(W_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 8(%1)"  : "=r"(C_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 12(%1)" : "=r"(gM)      : "r"(cfg));\n'
-        '    asm("lw_s %0, 16(%1)" : "=r"(gN)      : "r"(cfg));\n'
-        '    asm("lw_s %0, 20(%1)" : "=r"(gK)      : "r"(cfg));\n'
-        '    asm("lw_s %0, 24(%1)" : "=r"(M_tiles) : "r"(cfg));\n'
-        '    asm("lw_s %0, 28(%1)" : "=r"(N_tiles) : "r"(cfg));\n'
-        '    asm("lw_s %0, 32(%1)" : "=r"(K_tiles) : "r"(cfg));\n'
-        '    asm("lw_s %0, 36(%1)" : "=r"(tile_sz) : "r"(cfg));\n'
-        "\n"
-        "    int all_mask = -1;\n"
-        "    int ncols = 1;\n"
-        "    int sp_a = 0;\n"
-        "    int sp_w = 0;\n"
-        "    int sp_c = 0;\n"
-        f"{sdma_a_s}"
-        f"{sdma_w_s}"
-        f"{sdma_c_s}"
-        "\n"
-        "    int mi = 0;\n"
-        "    while (mi < M_tiles) {\n"
-        "        int ni = 0;\n"
-        "        while (ni < N_tiles) {\n"
-        "            int ki = 0;\n"
-        "            while (ki < K_tiles) {\n"
-        "                int a_off = mi * tile_sz * gK + ki * tile_sz;\n"
-        "                int a_byte = a_off * 2;\n"
-        "                int a_addr = A_GMEM + a_byte;\n"
-        "\n"
-        "                int w_off = ki * tile_sz * gN + ni * tile_sz;\n"
-        "                int w_byte = w_off * 2;\n"
-        "                int w_addr = W_GMEM + w_byte;\n"
-        "\n"
-        # Load weights into SP1, preload to systolic array
-        '                asm("scpad_ld %0, %1, %2" : : "r"(sp_w), "r"(w_addr), "r"(sdma_ctl_w));\n'
-        "\n"
-        "                int wi = 0;\n"
-        f"                while (wi < {tile_k}) {{\n"
-        "                    vec wvec;\n"
-        "                    int w_row = sp_w + wi;\n"
-        f'                    asm("vreg_ld %0, %1, %2, {tn1}, 1"\n'
-        '                        : "=v"(wvec) : "r"(w_row), "r"(ncols));\n'
-        '                    asm("lw_vi %0, %1, 0, m0" : "=v"(wvec) : "v"(wvec));\n'
-        "                    wi = wi + 1;\n"
-        "                }\n"
-        "\n"
-        # Now load input into SP0, output into SP1 (overwrites weight data)
-        '                asm("scpad_ld %0, %1, %2" : : "r"(sp_a), "r"(a_addr), "r"(sdma_ctl_a));\n'
-        "\n"
-        "                int c_off = mi * tile_sz * gN + ni * tile_sz;\n"
-        "                int c_byte = c_off * 2;\n"
-        "                int c_addr = C_GMEM + c_byte;\n"
-        '                asm("scpad_ld %0, %1, %2" : : "r"(sp_c), "r"(c_addr), "r"(sdma_ctl_c));\n'
-        "\n"
-        "                int ri = 0;\n"
-        f"                while (ri < {tile_m}) {{\n"
-        "                    vec a_row;\n"
-        "                    vec c_row;\n"
-        f'                    asm("vreg_ld %0, %1, %2, {tk1}, 0"\n'
-        '                        : "=v"(a_row) : "r"(ri), "r"(ncols));\n'
-        f'                    asm("vreg_ld %0, %1, %2, {tn1}, 1"\n'
-        '                        : "=v"(c_row) : "r"(ri), "r"(ncols));\n'
-        "\n"
-        "                    vec result = gemm(a_row, c_row, all_mask);\n"
-        "\n"
-        f'                    asm("vreg_st %0, %1, %2, {tn1}, 1"\n'
-        '                        : : "v"(result), "r"(ri), "r"(ncols));\n'
-        "                    ri = ri + 1;\n"
-        "                }\n"
-        "\n"
-        '                asm("scpad_st %0, %1, %2" : : "r"(sp_c), "r"(c_addr), "r"(sdma_ctl_c));\n'
-        "                ki = ki + 1;\n"
-        "            }\n"
-        "\n"
-        "            ni = ni + 1;\n"
-        "        }\n"
-        "        mi = mi + 1;\n"
-        "    }\n"
-        "\n"
-        '    asm("halt");\n'
-        "    return 0;\n"
-        "}\n"
-    )
-
-
-def _relu_c(total: int, width: int) -> str:
-    """Generate AtallaC for ReLU."""
-    rows = math.ceil(total / width)
-    w_m1 = width - 1
-    sp_rows = min(rows, TILE)
-    tile_count = math.ceil(rows / sp_rows)
-    tile_bytes = sp_rows * width * 2
-    sdma_s = _sdma_ctl_expr("sdma_ctl", 0, sp_rows, width, width)
-
-    return (
-        "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN_GMEM;\n"
-        "    int OUT_GMEM;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(IN_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(OUT_GMEM) : "r"(cfg));\n'
-        "\n"
-        "    int sp = 0;\n"
-        "    int all_mask = -1;\n"
-        "    int ncols = 1;\n"
-        f"{sdma_s}"
-        "\n"
-        "    vec zero_vec;\n"
-        '    asm("vreg_ld %0, %1, %2, ' + str(w_m1) + ', 0" : "=v"(zero_vec) : "r"(0), "r"(ncols));\n'
-        '    zero_vec = vec_op_masked("*", zero_vec, 0.0, all_mask);\n'
-        "\n"
-        "    int tile = 0;\n"
-        f"    while (tile < {tile_count}) {{\n"
-        '        asm("scpad_ld %0, %1, %2" : : "r"(sp), "r"(IN_GMEM), "r"(sdma_ctl));\n'
-        "\n"
-        "        int row = 0;\n"
-        f"        while (row < {sp_rows}) {{\n"
-        "            vec v;\n"
-        f'            asm("vreg_ld %0, %1, %2, {w_m1}, 0"\n'
-        '                : "=v"(v) : "r"(row), "r"(ncols));\n'
-        "\n"
-        '            int m_neg = make_mask("<", v, zero_vec, all_mask);\n'
-        '            vec result = vec_op_masked("*", v, 0.0, m_neg);\n'
-        "\n"
-        f'            asm("vreg_st %0, %1, %2, {w_m1}, 0"\n'
-        '                : : "v"(result), "r"(row), "r"(ncols));\n'
-        "            row = row + 1;\n"
-        "        }\n"
-        "\n"
-        '        asm("scpad_st %0, %1, %2" : : "r"(sp), "r"(OUT_GMEM), "r"(sdma_ctl));\n'
-        f"        IN_GMEM = IN_GMEM + {tile_bytes};\n"
-        f"        OUT_GMEM = OUT_GMEM + {tile_bytes};\n"
-        "        tile = tile + 1;\n"
-        "    }\n"
-        "\n"
-        '    asm("halt");\n'
-        "    return 0;\n"
-        "}\n"
-    )
-
-
-def _softmax_c(length: int) -> str:
-    """Generate AtallaC for softmax using rcp.bf for reciprocal."""
-    width = min(length, 32)
-    rows = math.ceil(length / 32)
-    w_m1 = width - 1
-    mask_val = -1 if width == 32 else (1 << width) - 1
-    sdma_s = _sdma_ctl_expr("sdma_ctl", 0, rows, width, width)
-
-    return (
-        "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN_GMEM;\n"
-        "    int dummy;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(IN_GMEM) : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(dummy)   : "r"(cfg));\n'
-        "\n"
-        "    int sp = 0;\n"
-        f"    int mask_val = {mask_val};\n"
-        "    int ncols = 1;\n"
-        f"{sdma_s}"
-        "\n"
-        '    asm("scpad_ld %0, %1, %2" : : "r"(sp), "r"(IN_GMEM), "r"(sdma_ctl));\n'
-        "\n"
-        "    int row = 0;\n"
-        f"    while (row < {rows}) {{\n"
-        "        vec v;\n"
-        f'        asm("vreg_ld %0, %1, %2, {w_m1}, 0" : "=v"(v) : "r"(row), "r"(ncols));\n'
-        "\n"
-        '        vec vmax = vec_op_masked("RMAX", v, 0.0, mask_val);\n'
-        '        vec shifted = vec_op_masked("-", v, vmax, mask_val);\n'
-        '        vec exp_v = vec_op_masked("EXP", shifted, 0.0, mask_val);\n'
-        '        vec sum_v = vec_op_masked("RSUM", exp_v, 0.0, mask_val);\n'
-        "\n"
-        "        float sum_f = sum_v[0];\n"
-        "        int sum_bits;\n"
-        "        int inv_bits;\n"
-        '        asm("stbf_s %0, %1, %2" : "=r"(sum_bits) : "r"(sum_f), "r"(0));\n'
-        '        asm("rcp_bf %0, %1, %2" : "=r"(inv_bits) : "r"(sum_bits), "r"(0));\n'
-        "        float inv_sum;\n"
-        '        asm("bfts_s %0, %1, %2" : "=r"(inv_sum) : "r"(inv_bits), "r"(0));\n'
-        '        vec result = vec_op_masked("*", exp_v, inv_sum, mask_val);\n'
-        "\n"
-        f'        asm("vreg_st %0, %1, %2, {w_m1}, 0" : : "v"(result), "r"(row), "r"(ncols));\n'
-        "        row = row + 1;\n"
-        "    }\n"
-        "\n"
-        '    asm("scpad_st %0, %1, %2" : : "r"(sp), "r"(IN_GMEM), "r"(sdma_ctl));\n'
-        "\n"
-        '    asm("halt");\n'
-        "    return 0;\n"
-        "}\n"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,33 +303,65 @@ def emit_maxpool(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
     pool, stride = p["pool"], p["stride"]
     H_out, W_out = p["H_out"], p["W_out"]
 
-    em = LayerEmission()
-    em.skip_emulator = True
-
     total = H * W * C
     flat = input_data.flatten()
     if len(flat) < total:
         padded = np.zeros(total, dtype=np.float32)
         padded[:len(flat)] = flat
         flat = padded
-    data_nchw = flat[:total].reshape(1, C, H, W)
 
-    out = np.full((1, C, H_out, W_out), -np.inf, dtype=np.float32)
+    out_shape = get_node_shape(node) or (1, C, H_out, W_out)
+    out_elems = C * H_out * W_out
+
+    if W > 32:
+        em = LayerEmission()
+        em.skip_emulator = True
+        data_nchw = flat[:total].reshape(1, C, H, W)
+        out = np.full((1, C, H_out, W_out), -np.inf, dtype=np.float32)
+        for c in range(C):
+            for oh in range(H_out):
+                for ow in range(W_out):
+                    for pr in range(pool):
+                        for pc_i in range(pool):
+                            ih, iw = oh * stride + pr, ow * stride + pc_i
+                            if ih < H and iw < W:
+                                out[0, c, oh, ow] = max(out[0, c, oh, ow],
+                                                         float(data_nchw[0, c, ih, iw]))
+        em.numpy_result = out.reshape(out_shape)
+        em.output_shape = out_shape
+        em.output_elements = out_elems
+        return em
+
+    # Kernel outputs full-width rows (vertical max only); horizontal
+    # stride-select + pool-width max done in post_process_maxpool.
+    IN_GMEM = 0x1000
+    channel_in_bytes = H * W * 2
+    raw_out_ch_bytes = H_out * W * 2
+    total_in_bytes = C * channel_in_bytes
+    total_raw_out = C * H_out * W
+    OUT_GMEM = IN_GMEM + _align_data(total_in_bytes)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, IN_GMEM)
+    img.u32(ADDR_TABLE + 4, OUT_GMEM)
+
+    data_nchw = flat[:total].reshape(C, H, W) if C > 0 else flat[:total].reshape(1, H, W)
     for c in range(C):
-        for oh in range(H_out):
-            for ow in range(W_out):
-                for pr in range(pool):
-                    for pc_i in range(pool):
-                        ih = oh * stride + pr
-                        iw = ow * stride + pc_i
-                        if ih < H and iw < W:
-                            out[0, c, oh, ow] = max(out[0, c, oh, ow],
-                                                     float(data_nchw[0, c, ih, iw]))
+        base = IN_GMEM + c * channel_in_bytes
+        for r in range(H):
+            for col in range(W):
+                img.bf16(base + (r * W + col) * 2, float(data_nchw[c, r, col]))
 
-    out_shape = get_node_shape(node)
-    em.numpy_result = out.reshape(out_shape) if out_shape else out
-    em.output_shape = out_shape if out_shape else (1, C, H_out, W_out)
-    em.output_elements = C * H_out * W_out
+    _write_zeros(img, OUT_GMEM, total_raw_out)
+
+    em = LayerEmission()
+    em.c_source = _maxpool_c(H, W, C, pool, stride)
+    em.dram = img
+    em.output_addr = OUT_GMEM
+    em.output_elements = total_raw_out
+    em.output_shape = (C, H_out, W)
+    em.maxpool_post = dict(C=C, H_out=H_out, W=W, W_out=W_out,
+                           pool=pool, stride=stride, final_shape=out_shape)
     return em
 
 
