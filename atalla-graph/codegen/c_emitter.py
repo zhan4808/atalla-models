@@ -23,7 +23,7 @@ _FUNC_SIM = Path(__file__).resolve().parent.parent.parent / "functional_sim"
 if str(_FUNC_SIM) not in sys.path:
     sys.path.insert(0, str(_FUNC_SIM))
 
-# Default: vendored copy inside atalla-models (kept in sync with atalla_arch_emul_robert).
+# Default: vendored copy inside atalla-models (master + isa-fixes branch).
 # Override with ATALLA_COMPILER_PATH if you want to point at the sibling repo directly.
 _default_compiler = Path(__file__).resolve().parent.parent.parent / "aihw-ppci-compiler"
 _COMPILER = Path(os.environ.get("ATALLA_COMPILER_PATH", str(_default_compiler)))

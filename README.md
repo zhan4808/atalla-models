@@ -4,8 +4,9 @@ End-to-end pipeline: PyTorch model → AtallaC → Atalla assembly → functiona
 
 ## Setup
 
-A vendored copy of `aihw-ppci-compiler` (branch `atalla_arch_emul_robert`) is included at
-`atalla-models/aihw-ppci-compiler/`. No sibling clone is required.
+A vendored copy of `aihw-ppci-compiler` (based on `origin/master` + `isa-fixes` branch) is
+included at `atalla-models/aihw-ppci-compiler/`. The `emulator/` directory is carried from
+`atalla_arch_emul_robert`. No sibling clone is required.
 
 To point at an external compiler instead:
 
@@ -53,7 +54,7 @@ atalla-models/
         build_*.py         standalone kernel generators (used for testing, not by pipeline)
         run.py
         tests/
-    aihw-ppci-compiler/    vendored compiler (atalla_arch_emul_robert branch)
+    aihw-ppci-compiler/    vendored compiler (master + isa-fixes)
         ppci/arch/atalla/  compiler backend
         emulator/          build_compiler.py: scheduler + encoder
         atalla_cc/         AtallaC frontend
@@ -95,7 +96,7 @@ all DRAM data to prevent compiler stack frames from corrupting tensor data.
 | Model | Emulated | NumPy | Passthrough | Cycles | Instructions | Final cos sim |
 |-------|----------|-------|-------------|--------|-------------|---------------|
 | BasicModule (dim=32, depth=2) | 5 | 4 | 0 | 5,582 | 3,846 | 0.868 |
-| AlexNetSmall (scale=0.01) | 15 | 3 | 1 | 182,736 | 116,227 | 0.198 |
+| AlexNetSmall (scale=0.01) | 15 | 3 | 1 | ~183K | ~116K | -0.416 |
 
 Both models produce **zero NaN** values. Cosine similarity degradation vs float32 reference
 is expected BF16 accumulation drift (16-bit mantissa). Individual BasicModule kernels achieve
@@ -107,11 +108,11 @@ cos=1.0; AlexNet compounds errors through 19 layers. See `PIPELINE_TECHNICAL_REF
 | Issue | Status |
 |-------|--------|
 | Notation mismatch (mnemonics, registers) | Fixed via build_compiler.compile_asm() |
-| sac operand missing from VV instructions | Fixed in atalla_arch_emul_robert |
-| MTS/STM token bit layout swapped | Fixed in atalla_arch_emul_robert |
-| halt/nop opcode mismatch | Fixed in atalla_arch_emul_robert |
-| Vector spill stores only 1/32 elements | Fixed: ty="VEC" on AtallaVectorRegister |
-| rcp.bf not recognized | Fixed in atalla_arch_emul_robert |
+| sac operand missing from VV instructions | Fixed in isa-fixes PR |
+| MTS/STM token bit layout swapped | Fixed in isa-fixes PR |
+| halt/nop opcode mismatch | Fixed in isa-fixes PR |
+| Vector spill stores only 1/32 elements | Fixed on master (STRVEC/LDRVEC `31, 0` dims) |
+| rcp.bf not recognized | Fixed on atalla_arch_emul_robert |
 | vreg_ld/st 7-arg format in C templates | Fixed in c_emitter.py (now 5-arg) |
 | scpad_ld/st 5-arg format in C templates | Fixed in c_emitter.py (now 3-register) |
 | No lw.vi compiler intrinsic | Workaround: inline asm `lw_vi` in C source |

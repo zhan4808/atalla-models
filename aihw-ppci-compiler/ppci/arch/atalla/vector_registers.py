@@ -4,7 +4,6 @@ from ..registers import Register, RegisterClass
 class AtallaVectorRegister(Register):
     """Vector register for SIMD operations"""
     bitsize = 32 * 16
-    ty = "VEC"
 
     def __repr__(self):
         if self.is_colored:
