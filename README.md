@@ -5,14 +5,7 @@ End-to-end pipeline: PyTorch model → AtallaC → Atalla assembly → functiona
 ## Setup
 
 A vendored copy of `aihw-ppci-compiler` (based on `origin/master` + `isa-fixes` branch) is
-included at `atalla-models/aihw-ppci-compiler/`. The `emulator/` directory is carried from
-`atalla_arch_emul_robert`. No sibling clone is required.
-
-To point at an external compiler instead:
-
-```bash
-export ATALLA_COMPILER_PATH=/path/to/aihw-ppci-compiler
-```
+included at `aihw-ppci-compiler/`. No sibling clone is required.
 
 ## Pipeline Flow
 
@@ -24,16 +17,16 @@ FX Graph
     |  tile_planner.py
     v
 Tiled FX Graph
-    |  c_emitter.py -- AtallaC per node + DRAMWriter tensor data
+    |  c_emitter.py + kernels/*.py — AtallaC per node + DRAMWriter tensor data
     v
 AtallaC .c
     |  ppci atalla_cc -S
     v
 ppci .s
-    |  build_compiler.compile_asm() -- notation conversion + scheduling + encoding
+    |  build_compiler.compile_asm() — VLIW scheduling + encoding
     v
 .in test file (instruction packets + .data tensor payloads)
-    |  functional_sim run.py
+    |  functional_sim
     v
 Emulator output
 ```
@@ -44,22 +37,27 @@ Emulator output
 atalla-models/
     atalla-graph/
         graph/             fx_capture.py, tile_planner.py, remove_ops.py
-        codegen/           c_emitter.py (primary), asm_emitter.py (reference)
+        codegen/           c_emitter.py (orchestrator), asm_converter.py, dram_builder.py
+        kernels/           AtallaC kernel generators (gemm.py, relu.py, softmax.py, maxpool.py)
         model/             basic.py, alexnet.py
         run_model.py       orchestrator + per-kernel metrics
         collect_metrics.py per-kernel and end-to-end metrics collection
     functional_sim/
         src/               functional_sim.py (emulator core), components/, misc/
-        build.py           DRAMWriter, render_testfile
-        build_*.py         standalone kernel generators (used for testing, not by pipeline)
-        run.py
+        build.py           DRAMWriter, render_testfile, assembler
+        build_compiler.py  compile_asm(): VLIW scheduling + encoding for compiler output
+        _asm_encoding.py   instruction encoding library (shared with build_compiler)
+        build_*.py         standalone kernel generators (team reference, not used by pipeline)
+        archive/           superseded conv scripts
+        run.py             standalone emulator entry point
         tests/
     aihw-ppci-compiler/    vendored compiler (master + isa-fixes)
         ppci/arch/atalla/  compiler backend
-        emulator/          build_compiler.py: scheduler + encoder
         atalla_cc/         AtallaC frontend
-        atalla_tests/      reference C programs
-    PIPELINE_TECHNICAL_REFERENCE.md   full architecture + metrics documentation
+        atalla_tests/
+            kernels/       reference .c kernels + validation harness
+            compile_and_convert.py   CLI: .c → ppci → build_compiler → .in
+    PIPELINE_TECHNICAL_REFERENCE.md
 ```
 
 ## Usage
@@ -68,24 +66,23 @@ atalla-models/
 cd atalla-graph
 python run_model.py --model basic
 python run_model.py --model alexnet --scale 0.01
-python collect_metrics.py   # full per-kernel metrics for both models
+python collect_metrics.py
 ```
 
 ## Key Design Decisions
 
-**C compiler path for all compute ops.** ReLU, Softmax, GEMM, Conv, and Linear generate
-AtallaC via `c_emitter.py`, compiled through ppci to `.s`, then scheduled and encoded by
-`build_compiler.compile_asm()` from `aihw-ppci-compiler/emulator/`. Non-compute ops
-(MaxPool, elementwise add/mul, adaptive avg pool) fall back to NumPy.
+**C compiler path for all compute ops.** ReLU, Softmax, GEMM, Conv, Linear, and MaxPool
+generate AtallaC via kernel generators in `atalla-graph/kernels/`, compiled through ppci
+to `.s`, then scheduled and encoded by `build_compiler.compile_asm()`. MaxPool vertical
+max is on-chip; horizontal stride-select is post-processed in Python.
 
-**`build_compiler.compile_asm()` replaces the legacy `asm_converter.py`.** Handles notation
-conversion (underscore to dot mnemonics, symbolic to $N registers), hazard scheduling, and
-binary encoding in one pass. Supports updated ISA instruction formats (register-based
-scpad_ld/st, 5-arg vreg_ld/st, sac on VV ops).
+**Kernel generators as a package.** Each kernel type (GEMM, ReLU, Softmax, MaxPool) has
+its own generator in `atalla-graph/kernels/`. `c_emitter.py` calls these with per-layer
+parameters. Reference `.c` files for fixed sizes live in `atalla_tests/kernels/`.
 
-**DRAMWriter data section.** `c_emitter.py` writes tensor data (weights, inputs, outputs)
-to a `DRAMWriter` keyed by byte address. `render_in_file()` merges instruction packets with
-the `.data` section into a single `.in` file.
+**`build_compiler.py` in `functional_sim/`.** Extended from Sahil's original to handle
+ppci's 3-register SDMA and 5-arg vreg formats. `_asm_encoding.py` provides the instruction
+encoding library. `compile_and_convert.py` is a CLI wrapper around the same engine.
 
 **Per-layer execution.** Each layer is a standalone emulator invocation. Activations pass
 between layers via the Python orchestrator. Stack pointer (`x2`) is set dynamically above
@@ -96,27 +93,26 @@ all DRAM data to prevent compiler stack frames from corrupting tensor data.
 | Model | Emulated | NumPy | Passthrough | Cycles | Instructions | Final cos sim |
 |-------|----------|-------|-------------|--------|-------------|---------------|
 | BasicModule (dim=32, depth=2) | 5 | 4 | 0 | 5,582 | 3,846 | 0.868 |
-| AlexNetSmall (scale=0.01) | 15 | 3 | 1 | ~183K | ~116K | -0.416 |
+| AlexNetSmall (scale=0.01) | 18 | 0 | 1 | ~183K | ~116K | 0.086 |
 
-Both models produce **zero NaN** values. Cosine similarity degradation vs float32 reference
-is expected BF16 accumulation drift (16-bit mantissa). Individual BasicModule kernels achieve
-cos=1.0; AlexNet compounds errors through 19 layers. See `PIPELINE_TECHNICAL_REFERENCE.md`
-§8 for full per-kernel metrics tables.
+All compute ops (including MaxPool) are emulated. Zero NaN values. Cosine similarity
+degradation is expected BF16 accumulation drift. See `PIPELINE_TECHNICAL_REFERENCE.md` for
+full per-kernel metrics.
 
 ## Compiler Status
 
 | Issue | Status |
 |-------|--------|
 | Notation mismatch (mnemonics, registers) | Fixed via build_compiler.compile_asm() |
-| sac operand missing from VV instructions | Fixed in isa-fixes PR |
-| MTS/STM token bit layout swapped | Fixed in isa-fixes PR |
-| halt/nop opcode mismatch | Fixed in isa-fixes PR |
+| sac operand on VV instructions | Fixed in isa-fixes branch |
+| MTS/STM token bit layout | Fixed in isa-fixes branch |
+| halt/nop opcode mismatch | Fixed in isa-fixes branch |
 | Vector spill stores only 1/32 elements | Fixed on master (STRVEC/LDRVEC `31, 0` dims) |
 | rcp.bf not recognized | Fixed on atalla_arch_emul_robert |
-| vreg_ld/st 7-arg format in C templates | Fixed in c_emitter.py (now 5-arg) |
-| scpad_ld/st 5-arg format in C templates | Fixed in c_emitter.py (now 3-register) |
-| No lw.vi compiler intrinsic | Workaround: inline asm `lw_vi` in C source |
-| Compiler only colors v1/v2 vector registers | Workaround: inline asm for vector ops |
+| vreg_ld/st format in C templates | Fixed (now 5-arg, handled by build_compiler) |
+| scpad_ld/st format in C templates | Fixed (now 3-register, handled by build_compiler) |
+| sqrti_vi / div_vs / shift_vi | Not yet supported in ppci ISA definitions |
+| stbf.s / bfts.s emulator semantics | Emulator bug: treats IEEE hex as plain int |
 
 ## Emulator Fixes
 
