@@ -1,16 +1,3 @@
-"""Per-layer AlexNet builder.
-
-Generates a .in file for a single AlexNet layer on the Atalla emulator.
-Supports: Conv (tiled im2col GEMM), ReLU, MaxPool, FC (tiled GEMM), Softmax.
-
-Usage:
-    python build_alexnet_layer.py --layer 1 -o tests/alexnet_layer1.in
-    python build_alexnet_layer.py --layer 2 -o tests/alexnet_layer2.in
-    ...
-    python build_alexnet_layer.py --layer 19 -o tests/alexnet_layer19.in
-
-With --scale <f> to reduce channel counts for faster testing.
-"""
 from __future__ import annotations
 
 import os, math, struct

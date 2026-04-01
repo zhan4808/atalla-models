@@ -1,10 +1,3 @@
-"""Tiled convolution: Conv as GEMM with im2col, tiled for arbitrary sizes.
-
-C[M, K_out] = A_im2col[M, K_flat] * W[K_flat, K_out]
-where M = N*Ho*Wo, K_flat = R*S*C, K_out = output channels.
-
-Tiles M, K_flat, K_out dimensions in blocks of up to 32.
-"""
 from __future__ import annotations
 
 import os, math

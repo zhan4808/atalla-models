@@ -1,13 +1,3 @@
-/*
- * ReLU kernel: max(0, x) element-wise on a tile loaded from DRAM.
- *
- * Config at ADDR_TABLE (0x3C):
- *   [0] IN_GMEM    [4] OUT_GMEM
- *
- * Fixed tile: 4 rows x 32 cols (128 bf16 elements).
- * Loads tile from DRAM into scratchpad, zeroes negatives, stores back.
- */
-
 #define CFG_BASE  0x3C
 #define WIDTH_M1  31
 #define ROWS      4
@@ -27,10 +17,8 @@ int main() {
     int sdma_ctl;
     asm("li_s %0, 133169183" : "=r"(sdma_ctl));
 
-    /* load input tile from DRAM to scratchpad */
     scpad_load(sp, IN_GMEM, sdma_ctl);
 
-    /* create zero vector: load any row then multiply by 0 */
     vec zero_vec = vector_load(0, ncols, 31, 0);
     zero_vec = vec_op_masked("*", zero_vec, 0.0, all_mask);
 
@@ -38,7 +26,6 @@ int main() {
     while (row < ROWS) {
         vec v = vector_load(row, ncols, 31, 0);
 
-        /* build mask of negative elements, then zero them out */
         int m_neg = make_mask("<", v, zero_vec, all_mask);
         vec result = vec_op_masked("*", v, 0.0, m_neg);
 
@@ -46,7 +33,6 @@ int main() {
         row = row + 1;
     }
 
-    /* store result tile back to DRAM */
     scpad_store(sp, OUT_GMEM, sdma_ctl);
 
     asm("halt");

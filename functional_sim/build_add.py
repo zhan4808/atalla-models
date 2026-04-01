@@ -1,8 +1,3 @@
-"""Hand-written assembly kernel for element-wise add: C = A + B.
-
-Dual-scratchpad approach: load A into SP0, B into SP1,
-add.vv row-by-row under all-ones mask, store result via SP0.
-"""
 from __future__ import annotations
 
 import os

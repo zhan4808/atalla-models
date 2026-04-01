@@ -57,6 +57,11 @@ def extract_loops(src: str) -> List[str]:
     return re.findall(r'while\s*\(([^)]+)\)', src)
 
 
+def has_c_call(src: str, name: str) -> bool:
+    """True if `name` appears as a function-like call in C source."""
+    return bool(re.search(rf"\b{re.escape(name)}\s*\(", src))
+
+
 # ---------------------------------------------------------------------------
 # Kernel match definitions
 # ---------------------------------------------------------------------------
@@ -138,10 +143,10 @@ def _match_maxpool() -> MatchResult:
 
 
 def _match_gemm() -> MatchResult:
-    """GEMM: The reference .c and pipeline generator differ structurally because
-    the pipeline generator uses a different loop ordering and SDMA strategy.
-    We compare high-level elements: both should have gemm() builtin calls,
-    nested while-loops for mi/ni/ki, and similar asm instruction sets."""
+    """GEMM: Reference .c and generator differ in loop order / scratchpad layout.
+    Both use C intrinsics (scpad_*, vector_*) for DMA/vreg, not asm("scpad_ld").
+    Require shared inline asm for config (lw_s, li_s, halt), matching intrinsics,
+    gemm() calls, and three nested tile loops."""
     from kernels.gemm import gemm_c
     gen = gemm_c(M=4, N=4, K=4)
     ref = (SCRIPT_DIR / "gemm_tiled.c").read_text()
@@ -156,18 +161,34 @@ def _match_gemm() -> MatchResult:
 
     gen_asm_set = set(extract_asm_ops(gen))
     ref_asm_set = set(extract_asm_ops(ref))
-    shared = gen_asm_set & ref_asm_set
-    required = {"lw_s", "scpad_ld", "scpad_st", "vreg_ld", "vreg_st", "halt"}
-    asm_ok = required.issubset(shared)
+    shared_asm = gen_asm_set & ref_asm_set
+    required_asm = {"lw_s", "li_s", "halt"}
+    asm_tokens_ok = required_asm.issubset(shared_asm)
+
+    intrinsic_names = (
+        "scpad_load",
+        "scpad_store",
+        "vector_load",
+        "vector_store",
+        "load_weights",
+    )
+    gen_intr = all(has_c_call(gen, n) for n in intrinsic_names)
+    ref_intr = all(has_c_call(ref, n) for n in intrinsic_names)
+    intrinsics_ok = gen_intr and ref_intr
+
+    asm_ok = asm_tokens_ok and intrinsics_ok
 
     notes_parts = []
     if not builtins_ok:
         notes_parts.append("missing gemm builtin")
     if not both_have_3_loops:
         notes_parts.append(f"loop count: gen={len(gen_loops)} ref={len(ref_loops)}")
-    if not asm_ok:
-        missing = required - shared
-        notes_parts.append(f"missing asm: {missing}")
+    if not asm_tokens_ok:
+        notes_parts.append(f"missing shared asm: {required_asm - shared_asm}")
+    if not gen_intr:
+        notes_parts.append("gen missing intrinsics")
+    if not ref_intr:
+        notes_parts.append("ref missing intrinsics")
 
     return MatchResult(
         "gemm",

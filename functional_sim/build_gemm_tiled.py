@@ -1,8 +1,3 @@
-"""Blocked GEMM: C[M,N] += A[M,K] * B[K,N], tiled in 32x32 blocks.
-
-The assembly loops over M-tiles, N-tiles, then K-tiles (reduction).
-Each K-tile iteration accumulates into C via gemm.vv (C_row += A_row @ B_tile).
-"""
 from __future__ import annotations
 
 import os, struct, math

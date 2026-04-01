@@ -1,16 +1,3 @@
-/*
- * Tiled GEMM kernel: C += A * W using systolic array.
- *
- * Config at ADDR_TABLE (0x3C):
- *   [0]  A_GMEM    [4]  W_GMEM    [8]  C_GMEM
- *   [12] M         [16] N         [20] K
- *   [24] M_tiles   [28] N_tiles   [32] K_tiles   [36] tile_sz
- *
- * Each tile is TILE x TILE (4x4 for this test).
- * Loads A, W tiles from DRAM into scratchpad, preloads W into systolic array,
- * runs GEMM row by row, stores C tile back.
- */
-
 #define CFG_BASE  0x3C
 #define TILE      4
 #define TILE_M1   3
@@ -48,7 +35,6 @@ int main() {
             int c_byte = c_off * 2;
             int c_addr = C_GMEM + c_byte;
 
-            /* load C tile accumulator into SP1 */
             scpad_load(sp_base, c_addr, sdma_ctl_sp1);
 
             int ki = 0;
@@ -61,7 +47,6 @@ int main() {
                 int w_byte = w_off * 2;
                 int w_addr = W_GMEM + w_byte;
 
-                /* load W tile into SP0, preload into systolic array */
                 scpad_load(sp_base, w_addr, sdma_ctl_sp0);
 
                 int wi = 0;
@@ -71,10 +56,8 @@ int main() {
                     wi = wi + 1;
                 }
 
-                /* load A tile into SP0 (safe: W already in systolic array) */
                 scpad_load(sp_base, a_addr, sdma_ctl_sp0);
 
-                /* GEMM: A from SP0, C accumulator from SP1 */
                 int ri = 0;
                 while (ri < TILE) {
                     vec a_row = vector_load(ri, ncols, 3, 0);
@@ -89,7 +72,6 @@ int main() {
                 ki = ki + 1;
             }
 
-            /* store C tile from SP1 back to DRAM */
             scpad_store(sp_base, c_addr, sdma_ctl_sp1);
             ni = ni + 1;
         }
