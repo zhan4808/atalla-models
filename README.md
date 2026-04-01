@@ -36,12 +36,12 @@ Emulator output
 ```
 atalla-models/
     atalla-graph/
-        graph/             fx_capture.py, tile_planner.py, remove_ops.py
-        codegen/           c_emitter.py (orchestrator), asm_converter.py, dram_builder.py
-        kernels/           AtallaC kernel generators (gemm.py, relu.py, softmax.py, maxpool.py)
+        graph/             fx_capture.py, tile_planner.py, lower_modules.py, memoryallocator.py
+        codegen/           c_emitter.py (orchestrator), dram_builder.py
+        kernels/           AtallaC kernel generators (gemm.py, relu.py, softmax.py, maxpool.py, add.py)
         model/             basic.py, alexnet.py
-        run_model.py       orchestrator + per-kernel metrics
-        collect_metrics.py per-kernel and end-to-end metrics collection
+        scripts/           generate_schedule.py (Vihaan's C schedule emitter)
+        run_graph.py       unified entry point: validate (emulator) or schedule (C codegen)
     functional_sim/
         src/               functional_sim.py (emulator core), components/, misc/
         build.py           DRAMWriter, render_testfile, assembler
@@ -64,19 +64,19 @@ atalla-models/
 
 ```bash
 cd atalla-graph
-python run_model.py --model basic
-python run_model.py --model alexnet --scale 0.01
-python collect_metrics.py
+python run_graph.py --model basic --mode validate
+python run_graph.py --model alexnet_small --mode validate
+python run_graph.py --model basic --mode schedule --out-dir out/basic
 ```
 
 ## Key Design Decisions
 
-**C compiler path for all compute ops.** ReLU, Softmax, GEMM, Conv, Linear, and MaxPool
+**C compiler path for all compute ops.** ReLU, Softmax, GEMM, Conv, Linear, MaxPool, and Add
 generate AtallaC via kernel generators in `atalla-graph/kernels/`, compiled through ppci
 to `.s`, then scheduled and encoded by `build_compiler.compile_asm()`. MaxPool vertical
 max is on-chip; horizontal stride-select is post-processed in Python.
 
-**Kernel generators as a package.** Each kernel type (GEMM, ReLU, Softmax, MaxPool) has
+**Kernel generators as a package.** Each kernel type (GEMM, ReLU, Softmax, MaxPool, Add) has
 its own generator in `atalla-graph/kernels/`. `c_emitter.py` calls these with per-layer
 parameters. Reference `.c` files for fixed sizes live in `atalla_tests/kernels/`.
 
@@ -90,14 +90,14 @@ all DRAM data to prevent compiler stack frames from corrupting tensor data.
 
 ## Validation Results
 
-| Model | Emulated | NumPy | Passthrough | Cycles | Instructions | Final cos sim |
-|-------|----------|-------|-------------|--------|-------------|---------------|
-| BasicModule (dim=32, depth=2) | 5 | 4 | 0 | 5,582 | 3,846 | 0.868 |
-| AlexNetSmall (scale=0.01) | 18 | 0 | 1 | ~183K | ~116K | 0.086 |
+| Model | Emulated | NumPy | Passthrough | Final cos sim |
+|-------|----------|-------|-------------|---------------|
+| BasicModule (dim=32, depth=2) | 9 | 1 (mul) | 1 | 0.9999 |
+| AlexNetSmall (scale=0.01) | 21 | 0 | 4 | 0.969 |
 
-All compute ops (including MaxPool) are emulated. Zero NaN values. Cosine similarity
-degradation is expected BF16 accumulation drift. See `PIPELINE_TECHNICAL_REFERENCE.md` for
-full per-kernel metrics.
+AlexNet runs **fully on-chip** with zero NumPy fallbacks. BasicModule has 1 remaining
+NumPy op (`mul` for residual scaling). Cosine degradation is expected BF16 drift.
+See `PIPELINE_TECHNICAL_REFERENCE.md` for details and `CONTRIBUTING.md` for how to add kernels.
 
 ## Compiler Status
 

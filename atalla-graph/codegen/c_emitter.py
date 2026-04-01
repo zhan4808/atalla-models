@@ -37,6 +37,7 @@ from kernels import gemm_c as _gemm_c
 from kernels import relu_c as _relu_c
 from kernels import softmax_c as _softmax_c
 from kernels import maxpool_c as _maxpool_c
+from kernels.add import add_c as _add_c
 
 
 def _to_bf16_array(tensor: torch.Tensor) -> np.ndarray:
@@ -407,11 +408,43 @@ def emit_add(node: Node, activation_cache: Dict[str, np.ndarray],
     if lhs is None:
         lhs = np.zeros_like(rhs)
 
+    total = max(lhs.size, rhs.size)
+    width = min(total, 32)
+    rows = math.ceil(total / width)
+
+    a_flat = lhs.flatten()
+    b_flat = rhs.flatten()
+    if len(b_flat) < len(a_flat):
+        b_flat = np.resize(b_flat, a_flat.shape)
+    elif len(a_flat) < len(b_flat):
+        a_flat = np.resize(a_flat, b_flat.shape)
+
+    A_GMEM = 0x1000
+    B_GMEM = A_GMEM + _align_data(rows * width * 2)
+    C_GMEM = B_GMEM + _align_data(rows * width * 2)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, A_GMEM)
+    img.u32(ADDR_TABLE + 4, B_GMEM)
+    img.u32(ADDR_TABLE + 8, C_GMEM)
+
+    padded_a = np.zeros(rows * width, dtype=np.float32)
+    padded_b = np.zeros(rows * width, dtype=np.float32)
+    padded_a[:len(a_flat)] = a_flat[:total]
+    padded_b[:len(b_flat)] = b_flat[:total]
+    for i in range(rows * width):
+        img.bf16(A_GMEM + i * 2, float(padded_a[i]))
+        img.bf16(B_GMEM + i * 2, float(padded_b[i]))
+
+    input_shape = get_node_shape(node)
+    out_shape = input_shape if input_shape else (total,)
+
     em = LayerEmission()
-    em.skip_emulator = True
-    em.numpy_result = (lhs.flatten() + rhs.flatten()).astype(np.float32)
-    em.output_shape = em.numpy_result.shape
-    em.output_elements = em.numpy_result.size
+    em.c_source = _add_c(total, width)
+    em.dram = img
+    em.output_addr = C_GMEM
+    em.output_shape = out_shape
+    em.output_elements = total
     return em
 
 
