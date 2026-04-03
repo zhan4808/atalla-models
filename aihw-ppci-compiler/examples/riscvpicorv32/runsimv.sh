@@ -1,3 +1,0 @@
-cd verilator
-./Vsystem
-cd ..

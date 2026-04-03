@@ -1,6 +1,0 @@
-
-leb128
-------
-
-.. automodule:: ppci.utils.leb128
-    :members:

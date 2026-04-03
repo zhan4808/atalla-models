@@ -1,3 +1,0 @@
-cd verilator
-./Vsystemdbg
-cd ..

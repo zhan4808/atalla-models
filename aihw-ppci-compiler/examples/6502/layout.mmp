@@ -1,5 +1,0 @@
-
-MEMORY upperram LOCATION=0x890 SIZE=0x1000 {
- SECTION(code)
-}
-
