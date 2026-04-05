@@ -1,136 +1,107 @@
-# Contributing: How to Add a New Kernel
+# Contributing: how to add a new kernel
 
-This guide walks through adding a new compute kernel to the Atalla pipeline,
-from standalone assembly verification up through the full graph-level integration.
+This guide walks through adding a compute kernel to the Atalla pipeline: standalone checks first, then AtallaC reference, then parameterized generator, then graph wiring.
 
-## Architecture Overview
+## Prerequisites
+
+- Clone **with submodules** (`functional_sim`, `aihw-ppci-compiler`). See `README.md`.
+- Python env with **PyTorch**, **NumPy**.
+- From repo root, emulator code lives in **`functional_sim/`** (submodule); graph code in **`atalla-graph/`**.
+
+## Architecture (four layers)
 
 ```
-Layer 1: functional_sim/build_*.py    — hand-written ASM kernel + DRAM setup, run on emulator
-Layer 2: aihw-ppci-compiler/atalla_tests/kernels/*.c  — reference AtallaC kernel (fixed tile size)
-Layer 3: atalla-graph/kernels/*.py    — parameterised AtallaC generator (arbitrary tensor shapes)
-Layer 4: atalla-graph/codegen/c_emitter.py  — graph-level emit function (wires DRAM + kernel)
+Layer 1: functional_sim/build_*.py     — hand-written asm + DRAMWriter; run on emulator
+Layer 2: aihw-ppci-compiler/atalla_tests/kernels/*.c — fixed-shape reference AtallaC
+Layer 3: atalla-graph/kernels/*.py   — parameterized AtallaC strings for arbitrary shapes
+Layer 4: atalla-graph/codegen/c_emitter.py — emit_* + DRAMWriter + graph plumbing
 ```
 
-Each layer builds on the one below. Start at Layer 1 and work up.
+Work bottom-up: validate Layer 1 on the emulator, then promote.
 
-## Step 0: Understand the Existing Examples
+## Step 0: Study `relu`
 
-Look at `relu` — it's the simplest kernel.
+| Layer | File | Role |
+|-------|------|------|
+| 1 | `functional_sim/build_relu.py` | Small BF16 tile, mask+ReLU, `render_testfile` |
+| 2 | `aihw-ppci-compiler/atalla_tests/kernels/relu.c` | Same idea in AtallaC |
+| 3 | `atalla-graph/kernels/relu.py` | `relu_c(total, width)` generator |
+| 4 | `c_emitter.py` → `emit_relu()` | DRAM + `relu_c()` + output addr |
 
-| Layer | File | What it does |
-|-------|------|--------------|
-| 1 | `functional_sim/build_relu.py` | Loads a 4×8 BF16 tile, applies max(x,0) via mask+zero, stores back |
-| 2 | `aihw-ppci-compiler/atalla_tests/kernels/relu.c` | Same logic in AtallaC using intrinsics |
-| 3 | `atalla-graph/kernels/relu.py` | Generates AtallaC string for arbitrary rows×width with tiling |
-| 4 | `c_emitter.py :: emit_relu()` | Packs input tensor into DRAM, calls `relu_c()`, reads output |
+Also read **`functional_sim/ASSEMBLY_SYNTAX.md`** for current **`scpad.ld` / `scpad.st`** (three scalar operands + packed metadata) and **`vreg.ld` / `vreg.st`** (five operands: vd/vs, base, row reg, `num_cols`, `sid`).
 
-## Step 1: Write the Assembly Kernel (`functional_sim/build_<op>.py`)
+## Step 1: Ground-truth asm (`functional_sim/build_<op>.py`)
 
-This is the ground truth. You hand-write Atalla assembly and set up DRAM data.
+Hand-write a minimal kernel and DRAM image using **`build.py`**: `DRAMWriter`, `assemble_file` (or scheduled path via `build_compiler.compile_asm` for multi-slot packets), `emit_test_format`, `render_testfile`.
+
+**Do not copy decade-old 5-operand `scpad.ld` text** from informal examples. Follow **`build_gemms.py`**, **`build_relu.py`**, or **`emit_sdma_metadata_asm()`** in `build.py` for SDMA setup, and **`ASSEMBLY_SYNTAX.md`** for mnemonics.
+
+Sketch:
 
 ```python
-# functional_sim/build_myop.py
+
 import numpy as np
 from build import DRAMWriter, assemble_file, emit_test_format, render_testfile
 
-INPUT_BASE  = 0x00001000
-OUTPUT_BASE = 0x00001040
-
-# 1. Write your assembly
-asm = """
-    lw.s   $3, 0($0)            # input base
-    lw.s   $8, 4($0)            # output base
-    addi.s $9, $0, 0
-    scpad.ld $9, $3, 8, 4, 0    # load tile SP0
-    addi.s $255, $0, -1
-    mv.stm 1, $255              # mask1 = all lanes
-
-    # --- your operation here ---
-    vreg.ld $4, $9, 8, 4, 0, 1, 0
-    # ... process rows ...
-    vreg.st $1, $9, 8, 4, 0, 1, 0
-
-    scpad.st $9, $8, 8, 4, 0
-    halt.s
-"""
-
-# 2. Set up DRAM data
-tensor = np.random.randn(4, 8).astype(np.float32)
-img = DRAMWriter()
-img.u32(0x0, INPUT_BASE)
-img.u32(0x4, OUTPUT_BASE)
-addr = INPUT_BASE
-for x in tensor.flatten():
-    img.bf16(addr, float(x))
-    addr += 2
-
-# 3. Assemble and render
-instrs = assemble_file(asm)
-final = render_testfile(emit_test_format(instrs), img.render_data_mem())
+# 1) asm: use li_s / scpad.ld rs1, rs2, rs3 / vreg.ld vd, rs1, rs2, ncols, sid / …
+# 2) DRAMWriter: ADDR_TABLE at 0x3C + bf16 payload
+# 3) instrs = assemble_file(asm)
+# 4) final = render_testfile(emit_test_format(instrs), img.render_data_mem())
 ```
 
 Run:
+
 ```bash
 cd functional_sim
 python build_myop.py -o tests/myop.in
-python run.py tests/myop.in
+python run.py --input_file tests/myop.in
 ```
 
-Read back the output region from the `.out` file and compare against NumPy.
+Compare emulator `.out` regions against NumPy.
 
-## Step 2: Write the Reference C Kernel (`aihw-ppci-compiler/atalla_tests/kernels/<op>.c`)
+## Step 2: Reference C (`aihw-ppci-compiler/atalla_tests/kernels/<op>.c`)
 
-Translate your assembly logic into AtallaC using intrinsics.
+Use intrinsics consistent with **`atalla-graph/kernels/*.py`** and the compiler README.
 
-**Key intrinsics:**
-| Intrinsic | What it does |
-|-----------|-------------|
-| `scpad_load(sp, gmem_addr, ctl)` | DMA: DRAM → scratchpad |
-| `scpad_store(sp, gmem_addr, ctl)` | DMA: scratchpad → DRAM |
-| `vector_load(row, ncols, width_m1, sid)` | Load row from scratchpad into vector register |
-| `vector_store(v, row, ncols, width_m1, sid)` | Store vector register to scratchpad row |
-| `vec_op_masked(op, a, b, mask)` | Element-wise op (`"+"`, `"-"`, `"*"`) under mask |
-| `make_mask(cmp, a, b, mask)` | Compare vectors, return mask (`"<"`, `">"`) |
-| `load_weights(v)` | Load weight vector from weight buffer |
-| `sqrt(x)` | Scalar BF16 square root |
+| Intrinsic | Role |
+|-----------|------|
+| `scpad_load(sp, gmem, sdma_ctl)` | DMA DRAM → scratchpad (third arg is packed metadata, often via `li_s`) |
+| `scpad_store(sp, gmem, sdma_ctl)` | Scratchpad → DRAM |
+| `vector_load(sp_row, row_idx, num_cols_m1, sid)` | Load one row into a `vec` |
+| `vector_store(v, sp_row, row_idx, num_cols_m1, sid)` | Store `vec` to scratchpad row |
+| `vec_op_masked(...)`, `make_mask(...)` | Masked element ops |
+| `load_weights(v)` | `lw.vi` path into systolic |
+| `gemm(...)` | MAC into accumulator vector |
+| `sqrt(x)` | Scalar BF16 sqrt (where supported) |
 
-**DRAM config table:** The kernel reads its DRAM pointers from a config table at
-address `0x3C` (decimal 60). Convention:
-- `[0x3C + 0]`: input address A
-- `[0x3C + 4]`: input address B (if binary op) or output address
-- `[0x3C + 8]`: output address C (if binary op)
+**ADDR_TABLE** base is **`0x3C` (decimal 60)** — same constant as `ADDR_TABLE` in `atalla-graph/kernels/common.py`.
 
-**SDMA control register:** Use inline asm `li_s` to load pre-computed bit-packed
-values (the compiler can't handle large immediates directly):
-```c
-int sdma_ctl;
-asm("li_s %0, 133169183" : "=r"(sdma_ctl));
-```
+**Packed SDMA control:** use `sdma_ctl_val` / `sdma_ctl_expr` from **`atalla-graph/kernels/common.py`** (or mirror the integer in `asm("li_s …")` in standalone C).
 
-Compute the value with `sdma_ctl_val(sid, num_rows, num_cols, full_cols)` from
-`atalla-graph/kernels/common.py`.
+Compile:
 
-**Compile test:**
 ```bash
 cd aihw-ppci-compiler
-python main.py atalla_tests/kernels/myop.c
+./atalla_cc -S atalla_tests/kernels/myop.c
 ```
 
-This produces a `.s` file. Feed it through `build_compiler`:
+Schedule / encode the `.s`:
+
 ```bash
-cd functional_sim
+cd ../functional_sim
 python -c "
 import build_compiler as bc
-text, _, _ = bc.compile_asm(open('../aihw-ppci-compiler/atalla_tests/kernels/myop.s').read())
-print(text[:500])
+s = open('../aihw-ppci-compiler/atalla_tests/kernels/myop.s').read()
+text, _, _ = bc.compile_asm(s)
+print(text[:800])
 "
 ```
 
-## Step 3: Write the Kernel Generator (`atalla-graph/kernels/<op>.py`)
+## Step 3: Generator (`atalla-graph/kernels/<op>.py`)
 
-Parameterise the C kernel for arbitrary tensor sizes. Your generator receives
-`total` elements and `width` (capped at 32), and returns AtallaC source as a string.
+Return AtallaC source as a string. Match **argument order** used in **`gemm.py` / `relu.py`** for `vector_load` / `vector_store` / `scpad_load`.
+
+Example shape (adjust ops and SDMA vars):
 
 ```python
 # atalla-graph/kernels/myop.py
@@ -154,7 +125,6 @@ def myop_c(total: int, width: int = 32) -> str:
         '    asm("lw_s %0, 4(%1)" : "=r"(OUT_GMEM) : "r"(cfg));\n'
         "\n"
         "    int sp = 0;\n"
-        "    int all_mask = -1;\n"
         "    int ncols = 1;\n"
         f"{sdma_s}"
         "\n"
@@ -164,11 +134,11 @@ def myop_c(total: int, width: int = 32) -> str:
         "\n"
         "        int row = 0;\n"
         f"        while (row < {sp_rows}) {{\n"
-        f"            vec v = vector_load(row, ncols, {w_m1}, 0);\n"
+        f"            vec v = vector_load(sp, row, {w_m1}, 0);\n"
         "\n"
-        "            /* --- your operation on v --- */\n"
+        "            /* --- your op on v --- */\n"
         "\n"
-        f"            vector_store(v, row, ncols, {w_m1}, 0);\n"
+        f"            vector_store(v, sp, row, {w_m1}, 0);\n"
         "            row = row + 1;\n"
         "        }\n"
         "\n"
@@ -184,90 +154,45 @@ def myop_c(total: int, width: int = 32) -> str:
     )
 ```
 
-**Register it** in `atalla-graph/kernels/__init__.py`:
-```python
-from kernels.myop import myop_c
-```
+Register in **`atalla-graph/kernels/__init__.py`** if you use a central export.
 
-## Step 4: Wire into the Graph Emitter (`c_emitter.py`)
+## Step 4: Graph emitter (`codegen/c_emitter.py`)
 
-Add an `emit_myop()` function in `atalla-graph/codegen/c_emitter.py`:
-
-```python
-def emit_myop(node, input_data, tc):
-    p = tc.params
-    total = p["total_elements"]
-    width = min(p["width"], 32)
-    rows = math.ceil(total / width)
-
-    flat = input_data.flatten()[:total]
-    IN_GMEM = 0x1000
-    OUT_GMEM = IN_GMEM + _align_data(rows * width * 2)
-
-    img = DRAMWriter()
-    img.u32(ADDR_TABLE + 0, IN_GMEM)
-    img.u32(ADDR_TABLE + 4, OUT_GMEM)
-
-    padded = np.zeros(rows * width, dtype=np.float32)
-    padded[:len(flat)] = flat
-    for i in range(rows * width):
-        img.bf16(IN_GMEM + i * 2, float(padded[i]))
-
-    em = LayerEmission()
-    em.c_source = myop_c(total, width)
-    em.dram = img
-    em.output_addr = OUT_GMEM
-    em.output_shape = get_node_shape(node) or (total,)
-    em.output_elements = total
-    return em
-```
-
-Then add the dispatch in `emit_node()`:
-```python
-elif atalla_op == "myop":
-    return emit_myop(node, input_data, tc)
-```
-
-And map the op in `atalla-graph/graph/fx_capture.py`:
-```python
-_OP_MAP[F.my_torch_function] = "myop"
-```
+Add **`emit_myop()`** building `LayerEmission` (`c_source`, `dram`, `output_addr`, shapes, flags). Dispatch from **`emit_node()`**. Map FX op → **`atalla_op`** string in **`graph/fx_capture.py`** (`_OP_MAP` / `_METHOD_MAP` / `_MODULE_MAP`).
 
 ## Step 5: Validate
 
 ```bash
-# Full model (basic module has all standard ops):
 cd atalla-graph
 python run_graph.py --model basic --mode validate
-
-# AlexNet:
 python run_graph.py --model alexnet_small --mode validate
+
+python run_graph.py --model basic --mode validate --metrics-json metrics_basic.json
 ```
 
-Look for your op in the output — it should say `emulator` not `NumPy`:
-```
-[myop_node] myop -> emulator (0x3000, 32 elems)... done (cos=0.9998)
-```
-<!-- 
-## Common Issues
+Expect **`emulator`** (not `NumPy`) for your op; check per-node cosine / `max_diff` in verbose logs.
+<!--
 
-| Problem | Fix |
-|---------|-----|
-| `Unknown mnemonic for scheduling` | Add alias in `functional_sim/build_compiler.py :: MNEMONIC_ALIASES` |
-| `value X cannot be fit into 25 bits` | Use `asm("li_s %0, VAL")` for large immediates; `build_compiler` expands to `lui_s + addi_s` |
-| `Tree ... not covered` | Reduce live vector variables; compiler stack frame may exceed 12-bit offset range |
-| `cosine_sim = 0.0` (all zeros) | Check BF16 register convention in `functional_sim.py :: bf16_reg_to_f32` |
-| Op runs as NumPy | Make sure `emit_myop` does NOT set `em.skip_emulator = True` and returns `em.c_source` |
+## Common issues
+
+| Problem | What to check |
+|---------|----------------|
+| `Unknown mnemonic for scheduling` | `build_compiler.py` aliases / spelling vs `ASSEMBLY_SYNTAX.md` |
+| Immediate / offset overflow | `asm("li_s %0, VAL")` or `sdma_ctl_expr` pattern |
+| `Tree … not covered` / stack errors | Reduce live `vec` variables; compiler frame limits |
+| `cos` ≈ 0 or garbage | BF16 layout, ADDR_TABLE, SDMA metadata, GEMM mask (`mv.stm`), spill vs GMEM in emulator |
+| Op stuck as NumPy | `skip_emulator` / missing `emit_*` dispatch / unsupported `atalla_op` |
 -->
 
-## File Quick Reference
+## File quick reference
 
-| What | Where |
-|------|-------|
-| Emulator core | `functional_sim/src/functional_sim.py` |
-| VLIW scheduler / encoder | `functional_sim/build_compiler.py` |
-| DRAMWriter + assembler | `functional_sim/build.py` |
-| Instruction opcodes | `functional_sim/src/misc/opcode_table.py` |
+| Piece | Location |
+|-------|----------|
+| Emulator loop | `functional_sim/src/functional_sim.py` |
+| Scratchpad / GMEM vector access | `functional_sim/src/components/scpad_ls.py` |
+| Scheduler + encoder | `functional_sim/build_compiler.py` |
+| DRAM + single-issue asm | `functional_sim/build.py` |
+| Opcodes | `functional_sim/src/misc/opcode_table.py` |
 | Compiler backend | `aihw-ppci-compiler/ppci/arch/atalla/` |
 | AtallaC frontend | `aihw-ppci-compiler/ppci/lang/atalla_c/` |
-| Technical reference | `pipeline_reference.md` |
+| Deep dive | `pipeline_reference.md` |

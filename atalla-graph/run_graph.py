@@ -11,6 +11,7 @@ Modes:
 Usage:
     python run_graph.py --model basic --mode both
     python run_graph.py --model alexnet_small --mode validate --scale 0.01
+    python run_graph.py --model basic --mode validate --metrics-json poster_metrics.json
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import shutil
 import struct
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Dict, FrozenSet, Optional, Set
 
@@ -111,6 +113,47 @@ def _nz_count(a: np.ndarray, eps: float = 1e-8) -> int:
     return int(np.count_nonzero(np.abs(a) > eps))
 
 
+def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
+    """Roll up poster / roofline metrics across all emulated layers."""
+    emus = [k for k in kernel_metrics if k.get("backend") == "emulator"]
+    tot_pkt = sum(int(k.get("sched_packets", 0)) for k in emus)
+    tot_slot = sum(int(k.get("sched_slots_filled", 0)) for k in emus)
+    tot_bl = sum(int(k.get("bytes_loaded", 0)) for k in emus)
+    tot_bw = sum(int(k.get("bytes_written", 0)) for k in emus)
+    tot_flops = sum(float(k.get("flops_total", 0.0)) for k in emus)
+    emu_pkts = sum(int(k.get("packets", 0)) for k in emus)
+    emu_ins = sum(int(k.get("instructions", 0)) for k in emus)
+    mem_b = tot_bl + tot_bw
+    hist: Counter = Counter()
+    for k in emus:
+        for sk, sv in k.get("sched_slot_histogram", {}).items():
+            hist[int(sk)] += int(sv)
+    n_empty_pkt = int(hist.get(0, 0))
+    n_nonempty_pkt = tot_pkt - n_empty_pkt
+    return {
+        "emulated_layer_count": len(emus),
+        # Includes empty scheduled packets (padding / alignment) in the denominator.
+        "aggregate_static_slot_efficiency": (tot_slot / (tot_pkt * 4.0)) if tot_pkt else 0.0,
+        # Excludes zero-fill packets — closer to “how full are packets that actually issue work”.
+        "aggregate_static_slot_efficiency_nonempty": (
+            (tot_slot / (n_nonempty_pkt * 4.0)) if n_nonempty_pkt else 0.0
+        ),
+        "aggregate_dynamic_slot_efficiency": (emu_ins / (emu_pkts * 4.0)) if emu_pkts else 0.0,
+        "total_sched_packets": tot_pkt,
+        "total_sched_slots_filled": tot_slot,
+        "total_emu_packets": emu_pkts,
+        "total_emu_instructions_retired": emu_ins,
+        "total_bytes_loaded": tot_bl,
+        "total_bytes_written": tot_bw,
+        "total_bytes_memory_traffic": mem_b,
+        "total_flops": tot_flops,
+        "aggregate_arithmetic_intensity": (tot_flops / mem_b) if mem_b > 0 else 0.0,
+        "aggregate_sched_slot_histogram": {str(k): v for k, v in sorted(hist.items())},
+        "sched_packets_empty": n_empty_pkt,
+        "sched_packets_nonempty": n_nonempty_pkt,
+    }
+
+
 # ── Front-end: shared across modes ──────────────────────────────────────────
 
 def build_graph(model: nn.Module, example_input: torch.Tensor,
@@ -170,6 +213,7 @@ def run_validate(
     *,
     kernel_bundle_dir: Optional[str] = None,
     kernel_bundle_ops: Optional[FrozenSet[str]] = None,
+    metrics_json_path: Optional[str] = None,
 ) -> Dict:
     """Per-node compile → emulate → compare vs PyTorch golden.
 
@@ -328,12 +372,27 @@ def run_validate(
         activation_cache[node.name] = result
         stats["emulated"] += 1
 
+        eu.perf_metrics.update_derived_metrics()
         pm = eu.perf_metrics.metrics
         ref = ref_activations.get(node.name)
-        km = {"name": node.name, "op": atalla_op, "backend": "emulator",
-              "shape": list(result.shape), "elems": int(result.size),
-              "packets": int(pm.get("packets", 0)),
-              "instructions": int(pm.get("instructions", 0))}
+        km = {
+            "name": node.name,
+            "op": atalla_op,
+            "backend": "emulator",
+            "shape": list(result.shape),
+            "elems": int(result.size),
+            "packets": int(pm.get("packets", 0)),
+            "instructions": int(pm.get("instructions", 0)),
+            "sched_packets": int(emission.sched_packets),
+            "sched_slots_filled": int(emission.sched_slots_filled),
+            "sched_slot_efficiency": float(emission.sched_slot_efficiency),
+            "sched_slot_histogram": dict(emission.sched_slot_histogram),
+            "bytes_loaded": int(pm.get("bytes_loaded", 0)),
+            "bytes_written": int(pm.get("bytes_written", 0)),
+            "flops_total": float(pm.get("flops_total", 0.0)),
+            "arithmetic_intensity": float(pm.get("arithmetic_intensity", 0.0)),
+            "arithmetic_intensity_loads": float(pm.get("arithmetic_intensity_loads", 0.0)),
+        }
         if ref is not None:
             km["cos_sim"] = _cos_sim(ref, result)
             km["max_diff"] = float(np.max(np.abs(
@@ -368,7 +427,11 @@ def run_validate(
                     f"emu_nz={km['emu_nz']}, ref_nz={km['ref_nz']}"
                     if "max_diff" in km else ""
                 )
-                print(f"done (cos={cos:.6f}{extra})")
+                se = km.get("sched_slot_efficiency", 0.0)
+                print(
+                    f"done (cos={cos:.6f}{extra}, "
+                    f"slot_eff={se:.3f}, bytes_ld={km['bytes_loaded']}, bytes_st={km['bytes_written']})"
+                )
             else:
                 print("done")
 
@@ -393,6 +456,8 @@ def run_validate(
         print(f"  Nodes: {stats['total']} total, {stats['emulated']} emulated, "
               f"{stats['numpy']} numpy, {stats['passthrough']} passthrough")
 
+    aggregate_metrics = _aggregate_kernel_metrics(kernel_metrics)
+
     if emu_out is not None and ref_out is not None:
         cos = _cos_sim(ref_out, emu_out)
         ef, rf = emu_out.flatten(), ref_out.flatten()
@@ -407,8 +472,39 @@ def run_validate(
             if cos > 0.95:
                 print("  PASS")
 
-    return {"stats": stats, "elapsed_s": elapsed, "kernel_metrics": kernel_metrics,
-            "emulator_output": emu_out, "reference_output": ref_out}
+    if verbose:
+        am = aggregate_metrics
+        print("\n--- Aggregate metrics (all emulated layers) ---")
+        print(f"  Static slot efficiency (all scheduled packets): {am['aggregate_static_slot_efficiency']:.4f}")
+        print(f"  Static slot efficiency (non-empty packets only): {am['aggregate_static_slot_efficiency_nonempty']:.4f}")
+        print(f"  Dynamic slot efficiency (emulator retired): {am['aggregate_dynamic_slot_efficiency']:.4f}")
+        print(f"  Total bytes loaded / written: {am['total_bytes_loaded']} / {am['total_bytes_written']}")
+        print(f"  Total FLOPs (model counters): {am['total_flops']:.0f}")
+        print(f"  Aggregate arithmetic intensity (FLOPs / byte moved): {am['aggregate_arithmetic_intensity']:.4f}")
+
+    out = {
+        "stats": stats,
+        "elapsed_s": elapsed,
+        "kernel_metrics": kernel_metrics,
+        "aggregate_metrics": aggregate_metrics,
+        "emulator_output": emu_out,
+        "reference_output": ref_out,
+    }
+    if metrics_json_path:
+        Path(metrics_json_path).parent.mkdir(parents=True, exist_ok=True)
+        # JSON-serializable snapshot for posters / spreadsheets
+        blob = {
+            "model": getattr(model, "__class__", type(model)).__name__,
+            "aggregate_metrics": aggregate_metrics,
+            "kernel_metrics": kernel_metrics,
+            "stats": stats,
+            "elapsed_s": elapsed,
+        }
+        Path(metrics_json_path).write_text(json.dumps(blob, indent=2) + "\n")
+        if verbose:
+            print(f"\nWrote metrics JSON: {metrics_json_path}")
+
+    return out
 
 
 def _resolve_transpose(ndim: int, args) -> tuple:
@@ -456,6 +552,12 @@ def main():
         ),
     )
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--metrics-json",
+        metavar="PATH",
+        default=None,
+        help="After validate, write per-layer + aggregate poster metrics to PATH (JSON).",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -474,6 +576,7 @@ def main():
             args.out_dir,
             verbose=verbose,
             kernel_bundle_dir=args.export_kernel_bundle,
+            metrics_json_path=args.metrics_json,
         )
 
     if args.mode in ("schedule", "both"):

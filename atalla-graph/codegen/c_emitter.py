@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import Counter
 import subprocess
 import sys
 from pathlib import Path
@@ -55,7 +56,8 @@ def _get_module(gm: GraphModule, target: str):
 class LayerEmission:
     __slots__ = ("c_source", "instr_text", "dram", "output_addr", "output_shape",
                  "output_elements", "skip_emulator", "numpy_result", "maxpool_post",
-                 "conv_post")
+                 "conv_post", "sched_packets", "sched_slots_filled", "sched_slot_efficiency",
+                 "sched_slot_histogram")
 
     def __init__(self):
         self.c_source: str = ""
@@ -68,6 +70,11 @@ class LayerEmission:
         self.numpy_result: Optional[np.ndarray] = None
         self.maxpool_post: Optional[dict] = None
         self.conv_post: Optional[dict] = None
+        # Filled by compile_and_assemble() from build_compiler VLIW schedule (static program).
+        self.sched_packets: int = 0
+        self.sched_slots_filled: int = 0
+        self.sched_slot_efficiency: float = 0.0
+        self.sched_slot_histogram: Dict[str, int] = {}
 
 
 def _align_data(nbytes: int) -> int:
@@ -559,7 +566,15 @@ def compile_and_assemble(emission: LayerEmission, work_dir: str,
     """
     if emission.c_source:
         raw_s = compile_c(emission.c_source, work_dir, tag)
-        in_content, _, _ = _bc.compile_asm(raw_s)
+        in_content, _ready, packets = _bc.compile_asm(raw_s)
+        n_pkt = len(packets)
+        n_slot = sum(len(p) for p in packets)
+        emission.sched_packets = n_pkt
+        emission.sched_slots_filled = n_slot
+        emission.sched_slot_efficiency = (n_slot / (n_pkt * 4.0)) if n_pkt else 0.0
+        emission.sched_slot_histogram = {
+            str(k): v for k, v in sorted(Counter(len(p) for p in packets).items())
+        }
         # compile_asm returns a complete .in file; strip the .data section
         # since render_in_file will add the populated DRAMWriter data
         emission.instr_text = in_content.split("\n.data")[0].strip()

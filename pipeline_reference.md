@@ -42,7 +42,7 @@ PATH 2: C COMPILER (primary graph pipeline)
 
 **Passthrough ops** (`flatten`, `transpose`, `dropout`) need no kernel — they're pure tensor reshapes with no computation. The Python orchestrator just reshapes the numpy array in `activation_cache` and passes it to the next layer. No `.in` file is generated.
 
-**Current status:** Only `mul` (BasicModule residual) still falls back to NumPy. AlexNet has **zero** NumPy fallbacks.
+**Current status:** Only `mul` (BasicModule residual) still falls back to NumPy. **AlexNetSmall** at default `scale` uses **zero** NumPy compute fallbacks (passthrough reshapes only).
 
 ---
 
@@ -108,7 +108,11 @@ All use first-class intrinsics. Only `lw_s`, `li_s`, `halt` remain as inline asm
 
 ### 2.4 `run_graph.py`
 
-Modes: `validate` (emulator execution + PyTorch comparison) and `schedule` (C codegen via Vihaan's `generate_schedule`).
+CLI: `--model {basic,alexnet_small}`, `--mode {validate,schedule,both}` (default `both`), `--out-dir` (default `out/graph`, **gitignored**), `--scale`, `--export-kernel-bundle`, `--quiet`.
+
+- **`validate`:** compile → `build_compiler` → `.in` → emulator vs FX reference (cosine / max diff per node).
+- **`schedule`:** Vihaan's `generate_schedule` path (C-focused export).
+- **`both`:** runs validate then schedule.
 
 ---
 
@@ -147,11 +151,11 @@ Modes: `validate` (emulator execution + PyTorch comparison) and `schedule` (C co
 
 | Component | Description |
 |-----------|-------------|
-| Scalar regs | 34 regs; x0=zero, x2=stack ptr, x33=spill base |
-| Mask regs | 16 regs; m0 hardwired to 0xFFFFFFFF |
-| Vector regs | 64 regs × 32 bf16 elements |
-| Scratchpads | SP0, SP1: 32 slots × 32 bf16 values |
-| Memory | DRAM, dictionary-based, 32-bit words at 2-byte stride |
+| Scalar regs | 34 regs; x0=zero, x2=stack ptr, x33=vector spill / GMEM boundary helper |
+| Mask regs | 16 predicate regs (**m0 is writable**, not hardwired); used with masked vector ops |
+| Vector regs | 64 regs × 32 BF16 lanes (compiler/emulator convention: BF16 in lower half of float word) |
+| Scratchpads | SP0, SP1: 32 rows × 32 BF16 elements (tile semantics per ISA) |
+| Memory | GMEM + scratchpad models; linear BF16 tensor regions vs compiler spill slots (see `scpad_ls.py`) |
 
 ### 4.2 Encoding Toolchain
 
@@ -171,18 +175,17 @@ Kernels read parameters from address **0x3C**:
 | ReLU/Softmax | IN_GMEM, OUT_GMEM |
 | Add | A_GMEM, B_GMEM, C_GMEM |
 
-### 4.4 Emulator Fixes We Made
+### 4.4 Emulator / toolchain alignment (high level)
 
-| Fix | What |
-|-----|------|
-| m0 = all-ones | Hardware spec; upstream returns 0 |
-| BF16 register convention | `bf16_reg_to_f32`/`f32_to_bf16_reg` for compiler's 16-bit-in-lower-half storage |
-| `gemm.vv` order | `gemm_weights @ v_in + v_acc` (W^T @ v_in) |
-| `lw.vi` weight reset | Clear `gemm_weights` between GEMM tiles |
-| Stack/DRAM overlap | Dynamic stack base above all DRAM data |
-| `stbf.s`/`bfts.s` | Proper BF16↔float conversion |
-| 3-reg SDMA decode | Bit 34 flag for compiler's packed control register format |
-| `sqrt.bf` support | New opcode + scalar ALU implementation |
+| Area | Notes |
+|------|--------|
+| Mask RF | m0 and siblings modeled as real predicate registers (not stuck at all-ones). |
+| BF16 in vector regs | Load/store paths match compiler packing (lower 16 bits of float word). |
+| GMEM vector loads (`vreg.ld` / spills) | Spill window vs BF16 tensor linear access (x33 + address rules). |
+| `gemm.vv` / `lw.vi` | Systolic weight buffer reset between tiles; ordering matches tiled GEMM. |
+| Stack vs tensors | Stack pointer placed above DRAM image so stack growth does not clobber weights/activations. |
+| SDMA | Three scalar operands: base addresses + packed metadata word (`emit_sdma_metadata_asm` in `build.py`). |
+| `build_compiler.py` | VLIW schedule + encode for compiler-emitted `.s`; paired with `instruction_latency.py`. |
 
 ---
 
@@ -242,7 +245,7 @@ Each layer is a standalone emulator invocation with fresh state. Stack pointer (
 
 1. `emit_<op>()` creates a `DRAMWriter` → writes config at 0x3C + input/weight tensors as BF16
 2. `compile_and_assemble()` produces the instruction section only (strips `.data` from `build_compiler` output)
-3. `render_in_file()` combines instruction section + `DRAMWriter.render_data_mem()` → complete `.in`
+3. `render_in_file()` in `c_emitter.py` wraps `functional_sim.build.render_testfile(instr, dram.render_data_mem())` → complete `.in`
 4. Emulator loads `.in`, kernel reads config via `lw_s`, uses SDMA to move tiles between DRAM and scratchpad
 5. `_read_bf16(mem, output_addr)` extracts output from emulator memory
 6. Output goes into `activation_cache` → next layer's `emit_<op>()` serializes it as input into a fresh `DRAMWriter`
@@ -272,15 +275,15 @@ After `lower_linear_modules`: **42 nodes** — 21 emulated (5 conv, 7 relu, 3 ma
 
 ## 8. Validation Results
 
-The functional simulator is not cycle-accurate. Primary efficiency metric is **VLIW slot utilization** (`instructions / (packets × 4)`).
+The functional simulator is not cycle-accurate. For **poster / roofline metrics** (static vs dynamic VLIW slot efficiency, SDMA bytes moved, FLOP counters, arithmetic intensity, per-layer histograms), run `run_graph.py --mode validate --metrics-json …` and see **`README.md` § Performance metrics (poster / roofline)**.
 
 ### BasicModule (dim=32, depth=2)
 
-9 emulated (cos=1.0 each), 1 numpy (mul), 1 passthrough. **End-to-end cos=0.9999.**
+Typical run: **9** emulated layers, **1** NumPy (`mul`), **1** passthrough; end-to-end cosine **≈0.99999** (BF16 + depth).
 
 ### AlexNetSmall (scale=0.01)
 
-21 emulated, 0 numpy, 4 passthrough. **End-to-end cos=0.969.** BF16 drift through 5 conv + 3 FC layers. No NaN.
+**21** emulated, **0** NumPy compute ops, **4** passthrough reshapes; end-to-end cosine **≈0.996** with accumulated BF16 error across conv + FC stack. Run `run_graph.py --mode validate` for exact metrics (`max_diff`, per-node cos).
 
 ---
 
@@ -299,21 +302,21 @@ The functional simulator is not cycle-accurate. Primary efficiency metric is **V
 - `ppci/arch.py` minor guard change
 - additive: `atalla_tests/kernels/` reference C kernels + validation scripts
 
-### Emulator (`functional_sim`)
+### Emulator (`functional_sim`) — [atalla-functional-sim](https://github.com/Purdue-SoCET/atalla-functional-sim)
 
-- bugs: m0 mask, BF16 register convention, gemm.vv order, lw.vi weight reset, stbf/bfts semantics, stack/DRAM overlap.
+Developed in lockstep with this repo; consumed as a **submodule** at `functional_sim/` (no longer copied from the full `atalla` monorepo in-tree).
 
-- new: ** 3-reg SDMA decode, sqrt.bf, div.vv/vs, vector spill memory, li.s, perf counters, sqrt/div latencies.
-
-- import fixes: relative → fallback imports for standalone execution.
-
-- added: `build_compiler.py`, `_asm_encoding.py`, `build_alexnet_layer.py`, `build_maxpool.py`, `validate_and_benchmark.py`.
+- **Memory / ISA fidelity:** BF16 GMEM linear access vs spill slots, mask register file, GEMM weight lifecycle, SDMA metadata, stack placement.
+- **Tooling:** `build.py` (assembler + `DRAMWriter` + `emit_sdma_metadata_asm`), `build_compiler.py` (scheduler/encoder), `instruction_latency.py`, assorted `build_*.py` references, `validate_and_benchmark.py`, `validate_build_generators.py`.
+- **Docs:** `ASSEMBLY_SYNTAX.md` (VM `vreg.ld`/`st` 5-operand form, 3-operand SDMA, etc.).
 
 ### Graph (`atalla-graph`)
 
-- untouched: `graph/export_fx.py`, `graph/lower_modules.py`, `graph/memoryallocator.py`, `scripts/generate_schedule.py`, `model/`, `main.py`, `kernels/kernels.c/h`.
+- **Upstream spine** (Vihaan): `graph/export_fx.py`, `graph/lower_modules.py`, `graph/memoryallocator.py`, `scripts/generate_schedule.py`, parts of `model/`, `main.py`, legacy `kernels/kernels.c/h` (as present).
 
-- added: `graph/fx_capture.py`, `graph/tile_planner.py`, `codegen/c_emitter.py`, `codegen/dram_builder.py`, `kernels/*.py`, `run_graph.py`, `model/alexnet_small.py`.
+- **SoCET / models layer:** `graph/fx_capture.py`, `graph/tile_planner.py`, `codegen/c_emitter.py`, `codegen/dram_builder.py`, `kernels/*.py` (AtallaC generators), `run_graph.py`, `model/alexnet_small.py`, export scripts under `scripts/`.
+
+- **Notable codegen behavior:** conv weight layout matches `im2col` patch order; optional conv bias broadcast into `C_GMEM`; conv output reshaped to NCHW for downstream nodes; BF16-aligned `activation_cache` for placeholders/weights; richer per-node validate stats in `run_graph.py`.
 
 ### Known Limitations
 
@@ -322,6 +325,8 @@ The functional simulator is not cycle-accurate. Primary efficiency metric is **V
 
 ---
 
-## 10. Open Items
+## 10. Open items
 
-`mul` kernel** (last NumPy fallback, not needed for alexnet), `sqrt.bf` opcode discrepancy b/w ppci and functional_sim (`sltu.bf` reassigned to `sqrt.bf`)
+- **`mul` kernel:** last common NumPy fallback on **BasicModule**; not required for AlexNetSmall.
+- **Opcode / mnemonic drift:** keep `ppci` `opcode_table.py` and `functional_sim` `opcode_table.py` in sync when adding instructions; watch for historical `sltu.bf` / `sqrt.bf` style collisions in older notes.
+- **Compiler limits:** stack frame / live-vector pressure; large immediates still often need `li_s` asm patterns (see `kernels/common.py`).
