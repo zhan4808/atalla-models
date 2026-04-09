@@ -1,13 +1,15 @@
 """AtallaC maxpool kernel: per-channel 2D max pooling (spatial W <= 32).
 
-Vertical max uses ``make_mask`` + ``vec_op_masked("+", row, zero, gt)`` (same as
-historical kernels). Horizontal pooling is applied in ``run_graph`` via
-``maxpool_post`` (masked ``RMAX`` + per-lane scatter in AtallaC is blocked by
-ppci mask-register allocation vs ``add.vv`` predicate operands).
-
-Note: when ``row == best`` everywhere, ``gt`` is all-zero and the emulator's
-masked ``add.vv`` path (``vd==vs2``) can drop ``best``; use non-constant inputs
-for validation or fix the functional_sim blend for that encoding.
+Vertical max uses ``make_mask`` + ``vec_op_masked("+", zero_vec, row, gt)``.
+  RA must not coalesce ``vd`` with either operand on masked ``add_vv`` (see
+  ``interferencegraph``); operand order ``zero + row`` avoids ``vd`` sharing
+  the candidate vreg with the running best slot.
+Horizontal reduction over the pool window is applied in ``run_graph`` via
+``maxpool_post`` (matches PyTorch / NumPy gold). A full on-chip horizontal
+path (``RMAX`` + masked scatter, as in ``functional_sim/build_maxpool.py``) is
+plausible now that ``mv_stm`` uses the DAG mask vreg in ppci, but the
+generated sequence still disagrees with the reference in emulation; keep post
+until that is debugged.
 """
 
 from kernels.common import ADDR_TABLE, sdma_ctl_expr
@@ -29,7 +31,7 @@ def maxpool_c(H: int, W: int, C: int, pool: int, stride: int) -> str:
             f"            int r{p} = in_row + {p};\n"
             f"            vec v{p} = vector_load(sp, r{p}, {w_m1}, 0);\n"
             f'            int gt{p} = make_mask(">", v{p}, best, all_mask);\n'
-            f'            best = vec_op_masked("+", v{p}, zero_vec, gt{p});\n'
+            f'            best = vec_op_masked("+", zero_vec, v{p}, gt{p});\n'
         )
 
     return (

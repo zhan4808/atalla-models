@@ -171,7 +171,15 @@ def emit_conv(node: Node, gm: GraphModule,
             weight_tensor = attr
         weight_np = _to_bf16_array(weight_tensor)
         if len(node.args) >= 3 and isinstance(node.args[2], Node):
-            bias_tensor = node.args[2].meta.get("val") if hasattr(node.args[2], "meta") else None
+            bias_node = node.args[2]
+            bias_tensor = None
+            if hasattr(bias_node, "meta") and bias_node.meta.get("val") is not None:
+                bias_tensor = bias_node.meta["val"]
+            if bias_tensor is None and bias_node.op == "get_attr":
+                attr = gm
+                for part in bias_node.target.split("."):
+                    attr = getattr(attr, part)
+                bias_tensor = attr
             if bias_tensor is not None:
                 bias_np = _to_bf16_array(bias_tensor).reshape(-1)
     # PyTorch conv weights are OIHW; im2col emits each patch in (r, s, c) order,
@@ -452,7 +460,6 @@ def emit_maxpool(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
     # horizontal max over the pool window is applied in run_graph (maxpool_post).
     IN_GMEM = 0x1000
     channel_in_bytes = H * W * 2
-    raw_out_ch_bytes = H_out * W * 2
     total_in_bytes = C * channel_in_bytes
     total_raw_out = C * H_out * W
     OUT_GMEM = IN_GMEM + _align_data(total_in_bytes)

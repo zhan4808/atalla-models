@@ -111,7 +111,7 @@ def _report(
     verbose: bool,
     *,
     weight_layout: str = "emitter",
-) -> None:
+) -> dict:
     work = str(_ROOT / "out" / "debug_matmul")
     emu = _run_gemm(A, W, work, case.replace(" ", "_"), weight_layout=weight_layout)
     ref = _ref_bf16(A, W)
@@ -139,6 +139,7 @@ def _report(
         _print_slice("W", W)
         _print_slice("ref", ref)
         _print_slice("emu", emu)
+    return m
 
 
 def main() -> None:
@@ -155,36 +156,64 @@ def main() -> None:
         default="emitter",
         help="emitter=match c_emitter._write_gemm_rhs_weight; legacy=old (K,N) row-major (wrong).",
     )
+    p.add_argument(
+        "--gate",
+        action="store_true",
+        help="Exit 1 if any run case fails BF16-style thresholds (cos>=0.995, rel_l2<0.02).",
+    )
     args = p.parse_args()
     rng = np.random.default_rng(args.seed)
     wl = args.weight_layout
 
+    def gate_ok(m: dict) -> bool:
+        return m["cos_sim"] >= 0.995 and m["rel_l2_error"] < 0.02
+
+    bad: list[str] = []
+
     if args.case in ("identity", "all"):
-        _report("identity I_4 @ W (4x4 @ 4x32)", np.eye(4, dtype=np.float32),
-                np.fromfunction(lambda i, j: 0.01 * (i * 32 + j), (4, 32), dtype=np.float32),
-                verbose=True, weight_layout=wl)
+        m = _report(
+            "identity I_4 @ W (4x4 @ 4x32)",
+            np.eye(4, dtype=np.float32),
+            np.fromfunction(lambda i, j: 0.01 * (i * 32 + j), (4, 32), dtype=np.float32),
+            verbose=True,
+            weight_layout=wl,
+        )
+        if args.gate and not gate_ok(m):
+            bad.append("identity")
     if args.case in ("one_hot", "all"):
         A = np.zeros((4, 32), dtype=np.float32)
         A[2, 5] = 1.0
         W = np.arange(32 * 32, dtype=np.float32).reshape(32, 32) * 0.001
-        _report("one_hot row2 col5 @ W (4x32 @ 32x32)", A, W, verbose=True, weight_layout=wl)
+        m = _report("one_hot row2 col5 @ W (4x32 @ 32x32)", A, W, verbose=True, weight_layout=wl)
+        if args.gate and not gate_ok(m):
+            bad.append("one_hot")
     if args.case in ("matmul2", "all"):
         A = rng.standard_normal((4, 32)).astype(np.float32) * 0.02
         W = rng.standard_normal((32, 32)).astype(np.float32) * 0.02
-        _report("matmul2-style (4x32) @ (32x32)", A, W, verbose=False, weight_layout=wl)
+        m = _report("matmul2-style (4x32) @ (32x32)", A, W, verbose=False, weight_layout=wl)
+        if args.gate and not gate_ok(m):
+            bad.append("matmul2")
     if args.case in ("matmul1", "all"):
         A = rng.standard_normal((4, 4)).astype(np.float32) * 0.05
         W = rng.standard_normal((4, 32)).astype(np.float32) * 0.05
-        _report("matmul1-style (4x4) @ (4x32)", A, W, verbose=True, weight_layout=wl)
+        m = _report("matmul1-style (4x4) @ (4x32)", A, W, verbose=True, weight_layout=wl)
+        if args.gate and not gate_ok(m):
+            bad.append("matmul1")
     if args.case in ("matmul7", "all"):
         A = rng.standard_normal((4, 32)).astype(np.float32) * 0.02
         W = rng.standard_normal((32, 64)).astype(np.float32) * 0.02
-        _report("matmul7-style (4x32) @ (32x64)", A, W, verbose=False, weight_layout=wl)
+        m = _report("matmul7-style (4x32) @ (32x64)", A, W, verbose=False, weight_layout=wl)
+        if args.gate and not gate_ok(m):
+            bad.append("matmul7")
 
     print("\nDone. Artifacts under out/debug_matmul/")
     print("Interpret: cos~1 & low rel_l2 => emulator matches PyTorch BF16 matmul.")
     print("If 'legacy' layout matches ref but 'emitter' does not, RHS packing in c_emitter is wrong.")
     print("If K < 32 cases still show emu_nz << ref_nz, suspect GEMM tile bounds (separate from transpose).")
+
+    if args.gate and bad:
+        print(f"\nGATE FAIL: {bad}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
