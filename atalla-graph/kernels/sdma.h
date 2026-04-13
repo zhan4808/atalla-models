@@ -2,7 +2,25 @@
 #define KERNELS_SDMA_H
 
 #define ATALLA_TILE 32
-#define SCPAD_BYTES 1048576u
+#define SCPAD_BYTES 1048576u /* 1 MB */
+#define SCPAD_TILE_MAX 512
+
+typedef struct {
+    int valid;
+    int dirty;
+    int tensor_id;
+    int tile_index;
+    int sid;
+    int scpad_addr;
+    int rows;
+    int cols;
+    int full_cols;
+} ScpadTile;
+
+typedef struct {
+    unsigned used_bytes;
+    ScpadTile entries[SCPAD_TILE_MAX];
+} ScpadState;
 
 static inline int _tile_dim(int total, int tile_i) {
     int start = tile_i * ATALLA_TILE;
