@@ -417,8 +417,26 @@ def emit_matmul(node: Node, gm: GraphModule,
         W_mat = _to_bf16_array(attr)
 
     A = input_data.reshape(-1, K)[:M, :]
-    if W_mat.shape != (K, N):
-        W_mat = W_mat.reshape(K, N) if W_mat.size == K * N else W_mat.T
+    W_mat = np.asarray(W_mat, dtype=np.float32)
+    # RHS must be logical (K, N) for C = A @ W. nn.Linear stores (N, K); lower_linear_modules
+    # uses matmul(x, weight.transpose(-1,-2)), so the transpose node's value is already (K, N).
+    # For square (K,K), (N,K) and (K,N) shapes collide — do not double-transpose that case.
+    rhs_tr = (
+        isinstance(rhs_node, Node)
+        and rhs_node.op == "call_method"
+        and rhs_node.target == "transpose"
+    )
+    if W_mat.shape == (K, N):
+        pass
+    elif W_mat.shape == (N, K) and N != K:
+        W_mat = W_mat.T
+    elif W_mat.shape == (N, K) and N == K:
+        if not rhs_tr:
+            W_mat = W_mat.T
+    elif W_mat.size == K * N:
+        W_mat = W_mat.reshape(K, N)
+    else:
+        W_mat = W_mat.T
     ks = _gemm_k_stride(K)
     A_dram = _padded_gemm_a(A, K)
 

@@ -317,7 +317,8 @@ def run_validate(
         print(f"\n--- Graph (validate_inputs={validate_inputs}) ---")
         print(
             "  Note: cos similarity is direction-only (ignores scale). Prefer "
-            "rmse, rel_l2, rel_max_abs (max_abs / max|ref|) for element error."
+            "rmse, rel_l2, rel_max_abs (max_abs / max|ref|) for element error. "
+            "Refs use the traced BF16 model (numpy float), i.e. BF16 matmul semantics."
         )
         if validate_inputs == "chained":
             print(
