@@ -15,6 +15,8 @@ Usage:
     python run_graph.py --model alexnet_small --mode validate --validate-inputs oracle
     python run_graph.py --model layernorm_smoke --mode validate --validate-inputs oracle
     python run_graph.py --model vit_micro --mode validate --validate-inputs oracle
+    python run_graph.py --model vit_micro --mode validate --layer-metrics-csv out/graph/layers.csv
+    python plot_graph_layer_packet_share.py --csv out/graph/vit_micro_layer_metrics.csv
 """
 from __future__ import annotations
 
@@ -40,6 +42,7 @@ if str(_FUNC_SIM) not in sys.path:
     sys.path.insert(0, str(_FUNC_SIM))
 
 from src.functional_sim import run as run_emulator
+from src.misc.instruction_retire import RETIRED_BUCKET_NAMES
 from src.misc.memory import Memory
 from src.components.scalar_register_file import ScalarRegisterFile, mask_register_file
 from src.components.vector_register_file import VectorRegisterFile
@@ -55,6 +58,7 @@ from codegen.c_emitter import (
     emit_node, render_in_file, compile_and_assemble, LayerEmission, _to_bf16_array,
 )
 from codegen.dram_builder import extract_input_data
+from graph.layer_metrics_csv import write_layer_metrics_csv, write_template_summary_csv
 
 
 DEFAULT_KERNEL_BUNDLE_OPS: FrozenSet[str] = frozenset(
@@ -175,6 +179,10 @@ def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
     tot_slot = sum(int(k.get("sched_slots_filled", 0)) for k in emus)
     tot_bl = sum(int(k.get("bytes_loaded", 0)) for k in emus)
     tot_bw = sum(int(k.get("bytes_written", 0)) for k in emus)
+    tot_bl0 = sum(int(k.get("bytes_loaded_sp0", 0)) for k in emus)
+    tot_bl1 = sum(int(k.get("bytes_loaded_sp1", 0)) for k in emus)
+    tot_bs0 = sum(int(k.get("bytes_stored_sp0", 0)) for k in emus)
+    tot_bs1 = sum(int(k.get("bytes_stored_sp1", 0)) for k in emus)
     tot_flops = sum(float(k.get("flops_total", 0.0)) for k in emus)
     emu_pkts = sum(
         int(
@@ -210,12 +218,22 @@ def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
         "total_emu_instructions_retired": emu_ins,
         "total_bytes_loaded": tot_bl,
         "total_bytes_written": tot_bw,
+        "total_bytes_loaded_sp0": tot_bl0,
+        "total_bytes_loaded_sp1": tot_bl1,
+        "total_bytes_stored_sp0": tot_bs0,
+        "total_bytes_stored_sp1": tot_bs1,
         "total_bytes_memory_traffic": mem_b,
         "total_flops": tot_flops,
         "aggregate_arithmetic_intensity": (tot_flops / mem_b) if mem_b > 0 else 0.0,
         "aggregate_sched_slot_histogram": {str(k): v for k, v in sorted(hist.items())},
         "sched_packets_empty": n_empty_pkt,
         "sched_packets_nonempty": n_nonempty_pkt,
+        **{
+            f"total_dyn_retired_{b}": sum(
+                int(k.get(f"dyn_retired_{b}", 0)) for k in emus
+            )
+            for b in RETIRED_BUCKET_NAMES
+        },
     }
 
 
@@ -279,6 +297,7 @@ def run_validate(
     kernel_bundle_dir: Optional[str] = None,
     kernel_bundle_ops: Optional[FrozenSet[str]] = None,
     metrics_json_path: Optional[str] = None,
+    layer_metrics_csv_path: Optional[str] = None,
     validate_inputs: str = "chained",
 ) -> Dict:
     """Per-node compile → emulate → compare vs PyTorch golden.
@@ -497,11 +516,24 @@ def run_validate(
             "sched_slot_efficiency": float(emission.sched_slot_efficiency),
             "sched_slot_histogram": dict(emission.sched_slot_histogram),
             "bytes_loaded": int(pm.get("bytes_loaded", 0)),
+            "bytes_loaded_sp0": int(pm.get("bytes_loaded_sp0", 0)),
+            "bytes_loaded_sp1": int(pm.get("bytes_loaded_sp1", 0)),
             "bytes_written": int(pm.get("bytes_written", 0)),
+            "bytes_stored_sp0": int(pm.get("bytes_stored_sp0", 0)),
+            "bytes_stored_sp1": int(pm.get("bytes_stored_sp1", 0)),
             "flops_total": float(pm.get("flops_total", 0.0)),
+            "flops_matmul": float(pm.get("flops_matmul", 0.0)),
+            "flops_vector": float(pm.get("flops_vector", 0.0)),
+            "flops_scalar": float(pm.get("flops_scalar", 0.0)),
+            "moveconvert_ops": int(pm.get("moveconvert_ops", 0)),
+            **{
+                f"dyn_retired_{b}": int(pm.get(f"dyn_retired_{b}", 0))
+                for b in RETIRED_BUCKET_NAMES
+            },
             "arithmetic_intensity": float(pm.get("arithmetic_intensity", 0.0)),
             "arithmetic_intensity_loads": float(pm.get("arithmetic_intensity_loads", 0.0)),
         }
+        km.update(emission.layer_metrics)
         if ref is not None:
             cmpm = _layer_compare_metrics(ref, result)
             km.update(cmpm)
@@ -627,6 +659,15 @@ def run_validate(
         if verbose:
             print(f"\nWrote metrics JSON: {metrics_json_path}")
 
+    if layer_metrics_csv_path:
+        p_csv = Path(layer_metrics_csv_path)
+        write_layer_metrics_csv(p_csv, kernel_metrics)
+        tpl_csv = p_csv.with_name(f"{p_csv.stem}_template_summary{p_csv.suffix}")
+        write_template_summary_csv(tpl_csv, kernel_metrics)
+        if verbose:
+            print(f"\nWrote per-layer metrics CSV: {layer_metrics_csv_path}")
+            print(f"Wrote template rollup CSV: {tpl_csv}")
+
     return out
 
 
@@ -689,6 +730,16 @@ def main():
         help="After validate, write per-layer + aggregate poster metrics to PATH (JSON).",
     )
     parser.add_argument(
+        "--layer-metrics-csv",
+        metavar="PATH",
+        default=None,
+        help=(
+            "After validate, write per-layer CSV plus *_template_summary.csv rollup "
+            "(grouped by GEMM M×N×K or add/LN/softmax geometry). Includes byte %% "
+            "split and flops/packet for GEMM-like layers."
+        ),
+    )
+    parser.add_argument(
         "--validate-inputs",
         choices=("chained", "oracle"),
         default="chained",
@@ -717,6 +768,7 @@ def main():
             verbose=verbose,
             kernel_bundle_dir=args.export_kernel_bundle,
             metrics_json_path=args.metrics_json,
+            layer_metrics_csv_path=args.layer_metrics_csv,
             validate_inputs=args.validate_inputs,
         )
 

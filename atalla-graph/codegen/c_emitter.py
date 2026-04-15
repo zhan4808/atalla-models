@@ -15,7 +15,7 @@ from collections import Counter
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -82,7 +82,7 @@ class LayerEmission:
     __slots__ = ("c_source", "instr_text", "dram", "output_addr", "output_shape",
                  "output_elements", "skip_emulator", "numpy_result", "maxpool_post",
                  "conv_post", "sched_packets", "sched_slots_filled", "sched_slot_efficiency",
-                 "sched_slot_histogram")
+                 "sched_slot_histogram", "layer_metrics")
 
     def __init__(self):
         self.c_source: str = ""
@@ -100,6 +100,8 @@ class LayerEmission:
         self.sched_slots_filled: int = 0
         self.sched_slot_efficiency: float = 0.0
         self.sched_slot_histogram: Dict[str, int] = {}
+        # Logical dims / byte estimates for CSV export (run_graph); not used by compiler.
+        self.layer_metrics: Dict[str, Any] = {}
 
 
 def _align_data(nbytes: int) -> int:
@@ -164,6 +166,29 @@ def _write_gemm_rhs_weight(img: DRAMWriter, base_addr: int, w_kn: np.ndarray) ->
 def _write_zeros(img: DRAMWriter, base_addr: int, count: int):
     for i in range(count):
         img.bf16(base_addr + i * 2, 0.0)
+
+
+def _gemm_map_metrics(M: int, N: int, K: int, *, kind: str = "gemm") -> Dict[str, Any]:
+    """Tiled GEMM / conv-as-GEMM: logical M,N,K, tile counts, DRAM BF16 byte estimates."""
+    ks = _gemm_k_stride(K)
+    return {
+        "map_kind": kind,
+        "map_M": int(M),
+        "map_N": int(N),
+        "map_K": int(K),
+        "map_TILE": int(TILE),
+        "map_M_tiles": int(math.ceil(M / TILE)),
+        "map_N_tiles": int(math.ceil(N / TILE)),
+        "map_K_tiles": int(math.ceil(K / TILE)),
+        "map_k_stride": int(ks),
+        "bytes_est_activation": int(M * ks * 2),
+        "bytes_est_weight": int(N * ks * 2),
+        "bytes_est_output": int(M * N * 2),
+        "bytes_est_Z_tile": int(TILE * 2),
+        "map_reuse_note": (
+            "A-tile sweeps N; W-tile sweeps M; K outer with accum in C (see tiled GEMM kernel)"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +282,16 @@ def emit_conv(node: Node, gm: GraphModule,
         "C": N,
         "final_shape": em.output_shape,
     }
+    em.layer_metrics = {
+        **_gemm_map_metrics(M, N, K, kind="conv_as_gemm"),
+        "map_R": int(R),
+        "map_S": int(S),
+        "map_C_in": int(C_in),
+        "map_H": int(H),
+        "map_W": int(W),
+        "map_Ho": int(p["Ho"]),
+        "map_Wo": int(p["Wo"]),
+    }
     return em
 
 
@@ -299,6 +334,7 @@ def emit_linear(node: Node, gm: GraphModule,
     em.output_addr = C_GMEM
     em.output_shape = out_shape if out_shape else (M, N)
     em.output_elements = M * N
+    em.layer_metrics = _gemm_map_metrics(M, N, K, kind="gemm")
     return em
 
 
@@ -330,6 +366,13 @@ def emit_relu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
     em.output_addr = OUT_GMEM
     em.output_shape = out_shape
     em.output_elements = total
+    em.layer_metrics = {
+        "map_kind": "relu",
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "bytes_est_in": int(rows * width * 2),
+        "bytes_est_out": int(rows * width * 2),
+    }
     return em
 
 
@@ -395,6 +438,12 @@ def emit_softmax(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
     em.output_addr = IN_GMEM
     em.output_shape = tuple(out_shape) if out_shape else (num_rows, row_len)
     em.output_elements = total
+    em.layer_metrics = {
+        "map_kind": "softmax",
+        "map_num_rows": int(num_rows),
+        "map_row_len": int(row_len),
+        "bytes_est_io_inplace": int(total * 2),
+    }
     return em
 
 
@@ -459,6 +508,7 @@ def emit_matmul(node: Node, gm: GraphModule,
     em.output_addr = C_GMEM
     em.output_shape = tuple(out_shape) if out_shape else ((M, N) if M > 1 else (N,))
     em.output_elements = M * N
+    em.layer_metrics = _gemm_map_metrics(M, N, K, kind="gemm")
     return em
 
 
@@ -526,6 +576,16 @@ def emit_maxpool(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
     em.output_shape = (C, H_out, W)
     em.maxpool_post = dict(C=C, H_out=H_out, W=W, W_out=W_out,
                            pool=pool, stride=stride, final_shape=out_shape)
+    em.layer_metrics = {
+        "map_kind": "maxpool",
+        "map_C": int(C),
+        "map_H": int(H),
+        "map_W": int(W),
+        "map_pool": int(pool),
+        "map_stride": int(stride),
+        "bytes_est_in": int(C * H * W * 2),
+        "bytes_est_out_raw": int(C * H_out * W * 2),
+    }
     return em
 
 
@@ -608,6 +668,14 @@ def emit_add(node: Node, activation_cache: Dict[str, np.ndarray],
     em.output_addr = C_GMEM
     em.output_shape = out_shape
     em.output_elements = total
+    em.layer_metrics = {
+        "map_kind": "add",
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "bytes_est_a": int(rows * width * 2),
+        "bytes_est_b": int(rows * width * 2),
+        "bytes_est_out": int(rows * width * 2),
+    }
     return em
 
 
@@ -679,6 +747,15 @@ def emit_layernorm(
         em.output_shape = os
         em.output_elements = need
         em.skip_emulator = False
+        em.layer_metrics = {
+            "map_kind": "layernorm",
+            "map_M_rows": int(M),
+            "map_D": int(D),
+            "bytes_est_input": int(M * D * 2),
+            "bytes_est_output": int(M * D * 2),
+            "bytes_est_gamma": int(D * 2),
+            "bytes_est_beta": int(D * 2),
+        }
         return em
 
     x = torch.from_numpy(flat.reshape(M, D)).to(torch.bfloat16)
