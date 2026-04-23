@@ -31,7 +31,5 @@ class BasicModule(nn.Module):
             out = torch.matmul(out, weight)
             out = out + bias
             out = F.relu(out)
-            if idx % 2 == 1:
-                out = out + 0.5 * residual
         out = self.output(out)
         return out

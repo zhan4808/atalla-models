@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
 from graph.memoryallocator import (
@@ -25,6 +24,16 @@ from graph.memoryallocator import (
     VIEW_FUNCTIONS,
     VIEW_METHODS,
 )
+from scripts.policies import (
+    build_add_plan,
+    build_conv_plan,
+    build_matmul_plan,
+    build_maxpool_plan,
+    build_relu_plan,
+    build_softmax_plan,
+)
+from scripts.tile_manager import plan_tile_moves
+from scripts.tile_structures import OpPlan, StepKind
 
 MAX_RANK = 8
 
@@ -46,6 +55,17 @@ RELU_TARGETS = {
     torch.ops.aten.relu.default,
 }
 
+SOFTMAX_TARGETS = {
+    torch.softmax,
+    torch.nn.functional.softmax,
+}
+if hasattr(torch.ops.aten, "_softmax"):
+    SOFTMAX_TARGETS.add(torch.ops.aten._softmax.default)
+
+MAXPOOL_TARGETS = {
+    torch.nn.functional.max_pool2d,
+}
+
 MUL_TARGETS = {
     operator.mul,
     torch.mul,
@@ -53,11 +73,7 @@ MUL_TARGETS = {
 }
 
 CONV_TARGETS = {
-    F.conv2d,
-}
-
-AVGPOOL_TARGETS = {
-    F.avg_pool2d,
+    torch.nn.functional.conv2d,
 }
 
 # Functions like builtins.getattr don't need kernels
@@ -151,74 +167,6 @@ def _as_pair(value: Sequence[int] | int) -> Tuple[int, int]:
     return int(value), int(value)
 
 
-# Read the spatial height/width from tensor metadata
-def _spatial_dims(node: Node) -> Tuple[int, int]:
-    tensor_meta = node.meta.get("tensor_meta")
-    if tensor_meta is None or tensor_meta.shape is None or len(tensor_meta.shape) < 2:
-        raise ValueError(f"Node {node.name} lacks spatial dims in tensor_meta")
-    height = int(tensor_meta.shape[-2])
-    width = int(tensor_meta.shape[-1])
-    return height, width
-
-
-# Populate AdaptiveAvgPool2d output size (None for FX node)
-def _resolve_adaptive_size(
-    size: Sequence[Optional[int]] | int | None,
-    input_h: int,
-    input_w: int,
-) -> Tuple[int, int]:
-    if size is None:
-        return input_h, input_w
-    if isinstance(size, Sequence):
-        out_h = size[0] if len(size) > 0 else None
-        out_w = size[1] if len(size) > 1 else None
-        out_h = input_h if out_h is None else int(out_h)
-        out_w = input_w if out_w is None else int(out_w)
-    else:
-        if size is None:
-            return input_h, input_w
-        out_h = out_w = int(size)
-    return max(1, out_h), max(1, out_w)
-
-
-#format avgpool kernel invocations
-def _format_avgpool_call(
-    src: str,
-    dst: str,
-    kernel: Tuple[int, int],
-    stride: Tuple[int, int],
-    padding: Tuple[int, int],
-    global_pool: int = 0,
-) -> str:
-    k_h, k_w = kernel
-    s_h, s_w = stride
-    p_h, p_w = padding
-    return (
-        f"    avgpool_kernel({src}, {dst}, {k_h}, {k_w}, {s_h}, "
-        f"{s_w}, {p_h}, {p_w}, {global_pool});\n"
-    )
-
-
-#format maxpool kernel invocations
-def _format_maxpool_call(
-    src: str,
-    dst: str,
-    kernel: Tuple[int, int],
-    stride: Tuple[int, int],
-    padding: Tuple[int, int],
-    dilation: Tuple[int, int],
-    ceil_mode: int,
-) -> str:
-    k_h, k_w = kernel
-    s_h, s_w = stride
-    p_h, p_w = padding
-    d_h, d_w = dilation
-    return (
-        f"    maxpool_kernel({src}, {dst}, {k_h}, {k_w}, {s_h}, {s_w}, "
-        f"{p_h}, {p_w}, {d_h}, {d_w}, {ceil_mode});\n"
-    )
-
-
 @dataclass
 class TensorSpec:
     identifier: str
@@ -296,13 +244,6 @@ def _tensor_ref(node: Node, specs: Dict[Node, TensorSpec]) -> str:
     return f"&tensor_{spec.identifier}_gt"
 
 
-#  _tensor_ref but emites NULL when node is None (e.g: optional bias)
-def _tensor_ref_optional(node: Optional[Node], specs: Dict[Node, TensorSpec]) -> str:
-    if node is None:
-        return "NULL"
-    return _tensor_ref(node, specs)
-
-
 #  Get a  positional argument from an FX node
 def _get_node_arg(node: Node, position: int, *, fallback: Optional[str] = None) -> Node:
     if len(node.args) > position and isinstance(node.args[position], Node):
@@ -314,242 +255,52 @@ def _get_node_arg(node: Node, position: int, *, fallback: Optional[str] = None) 
     raise ValueError(f"Node {node.name} lacks argument {position}")
 
 
-#  Tensor vs numeric operands for mul nodes.
-def _tensor_or_scalar_arg(
-    arg: object, specs: Dict[Node, TensorSpec], *, node_name: str
-) -> Tuple[Optional[str], Optional[float]]:
-    if isinstance(arg, Node):
-        return _tensor_ref(arg, specs), None
-    if isinstance(arg, (int, float)):
-        return None, float(arg)
-    raise ValueError(f"Mul node {node_name} has unsupported operand type {type(arg)}")
+def _kernel_missing(op_name: str, node: Node) -> NotImplementedError:
+    return NotImplementedError(f"Kernel does not exist for {op_name} (node {node.name})")
 
 
-'''
-Find tensor×scalar mul nodes whose only user is an add, so we can put the
-scalar into the add kernel (e.g., turn `add(out, mul(residual, 0.5))` into a
-single `add_kernel(out, residual, dst, 0.5)` call).
-'''
-def _detect_scaled_args(gm: GraphModule) -> Dict[Node, Tuple[Node, float]]:
-    scaled: Dict[Node, Tuple[Node, float]] = {}
-    for node in gm.graph.nodes:
-        if node.op != "call_function" or node.target not in MUL_TARGETS:
-            continue
-        if len(node.args) != 2:
-            continue
-        tensor_arg: Optional[Node] = None
-        scalar: Optional[float] = None
-        for arg in node.args:
-            if isinstance(arg, Node):
-                tensor_arg = arg
-            elif isinstance(arg, (int, float)):
-                scalar = float(arg)
-        if tensor_arg is None or scalar is None:
-            continue
-        users = list(node.users.keys())
-        if len(users) != 1:
-            continue
-        user = users[0]
-        if user.op != "call_function" or user.target not in ADD_TARGETS:
-            continue
-        scaled[node] = (tensor_arg, scalar)
-    return scaled
-
-
-# Prepare lhs/rhs/alpha for add kernels
+# Prepare lhs/rhs for add kernels.
 def _add_operands(
     node: Node,
     specs: Dict[Node, TensorSpec],
-    scaled_mul: Dict[Node, Tuple[Node, float]],
-) -> Tuple[str, str, float]:
-    lhs = _get_node_arg(node, 0)
-    rhs = _get_node_arg(node, 1, fallback="other")
+) -> Tuple[Node, Node]:
+    lhs_obj: object
+    rhs_obj: object
+
+    if len(node.args) > 0:
+        lhs_obj = node.args[0]
+    else:
+        lhs_obj = node.kwargs.get("input")
+    if len(node.args) > 1:
+        rhs_obj = node.args[1]
+    else:
+        rhs_obj = node.kwargs.get("other")
+
+    if not isinstance(lhs_obj, Node):
+        raise _kernel_missing("add", node)
+    if not isinstance(rhs_obj, Node):
+        if isinstance(rhs_obj, (int, float)):
+            raise _kernel_missing("add_scalar", node)
+        raise _kernel_missing("add", node)
+
+    lhs = lhs_obj
+    rhs = rhs_obj
     alpha = float(node.kwargs.get("alpha", 1.0))
-
-    lhs_node = lhs
-    rhs_node = rhs
-    lhs_scaled = lhs_node in scaled_mul
-    rhs_scaled = rhs_node in scaled_mul
-
-    if lhs_scaled and rhs_scaled:
-        raise ValueError(f"Add node {node.name} has two scaled operands; unsupported.")
-
-    if lhs_scaled:
-        scaled_source, factor = scaled_mul[lhs_node]
-        lhs_node, rhs_node = rhs_node, scaled_source
-        alpha *= factor
-    elif rhs_scaled:
-        scaled_source, factor = scaled_mul[rhs_node]
-        rhs_node = scaled_source
-        alpha *= factor
-
-    lhs_ref = _tensor_ref(lhs_node, specs)
-    rhs_ref = _tensor_ref(rhs_node, specs)
-    return lhs_ref, rhs_ref, alpha
-
-
-# Emit a kernel call string for an FX node 
-def _render_call(
-    gm: GraphModule,
-    node: Node,
-    specs: Dict[Node, TensorSpec],
-    scaled_mul: Dict[Node, Tuple[Node, float]],
-    attr_nodes: Dict[str, Node],
-) -> Optional[str]:
-    if node.op == "call_module":
-        module = gm.get_submodule(node.target)
-        if isinstance(module, torch.nn.Linear):
-            input_node = _get_node_arg(node, 0)
-            weight_attr = f"{node.target}.weight"
-            weight_node = attr_nodes.get(weight_attr)
-            if weight_node is None:
-                raise ValueError(f"Missing get_attr node for {weight_attr}")
-            dst = _tensor_ref(node, specs)
-            matmul_call = (
-                f"    matmul_kernel({_tensor_ref(input_node, specs)}, "
-                f"{_tensor_ref(weight_node, specs)}, {dst});\n"
-            )
-            if module.bias is None:
-                return matmul_call
-            bias_attr = f"{node.target}.bias"
-            bias_node = attr_nodes.get(bias_attr)
-            if bias_node is None:
-                raise ValueError(f"Missing get_attr node for {bias_attr}")
-            add_call = (
-                f"    add_kernel({dst}, {_tensor_ref(bias_node, specs)}, {dst}, 1.0f);\n"
-            )
-            return matmul_call + add_call
-        if isinstance(module, torch.nn.MaxPool2d):
-            input_node = _get_node_arg(node, 0)
-            kernel = _as_pair(module.kernel_size)
-            stride = module.stride if module.stride is not None else module.kernel_size
-            stride = _as_pair(stride)
-            padding = _as_pair(module.padding)
-            dilation = _as_pair(module.dilation)
-            ceil_flag = 1 if module.ceil_mode else 0
-            return _format_maxpool_call(
-                _tensor_ref(input_node, specs),
-                _tensor_ref(node, specs),
-                kernel,
-                stride,
-                padding,
-                dilation,
-                ceil_flag,
-            )
-        if isinstance(module, torch.nn.AdaptiveAvgPool2d):
-            input_node = _get_node_arg(node, 0)
-            input_h, input_w = _spatial_dims(input_node)
-            out_h, out_w = _resolve_adaptive_size(module.output_size, input_h, input_w)
-            stride_h = max(1, input_h // out_h)
-            stride_w = max(1, input_w // out_w)
-            kernel_h = input_h - (out_h - 1) * stride_h
-            kernel_w = input_w - (out_w - 1) * stride_w
-            if kernel_h <= 0 or kernel_w <= 0:
-                raise ValueError(
-                    f"AdaptiveAvgPool2d at {node.name} produced non-positive kernel size"
-                )
-            return _format_avgpool_call(
-                _tensor_ref(input_node, specs),
-                _tensor_ref(node, specs),
-                (kernel_h, kernel_w),
-                (stride_h, stride_w),
-                (0, 0),
-                global_pool=0,
-            )
-        # Other modules should have been lowered.
-        return None
-
-    if node.op == "call_method":
-        method = node.target.strip("'")
-        if method in VIEW_METHODS:
-            return None
-        if method == "mean":
-            src = _tensor_ref(_get_node_arg(node, 0), specs)
-            dst = _tensor_ref(node, specs)
-            return _format_avgpool_call(src, dst, (0, 0), (0, 0), (0, 0), global_pool=1)
-        return None
-
-    if node.op != "call_function":
-        return None
-    if node.target in IGNORED_FUNCTIONS:
-        return None
-    if node.target in MATMUL_TARGETS:
-        lhs = _tensor_ref(_get_node_arg(node, 0), specs)
-        rhs = _tensor_ref(_get_node_arg(node, 1), specs)
-        dst = _tensor_ref(node, specs)
-        return f"    matmul_kernel({lhs}, {rhs}, {dst});\n"
-    if node.target in MUL_TARGETS:
-        if node in scaled_mul:
-           #already folded into an add
-            return None
-        if len(node.args) >= 2:
-            lhs_arg = node.args[0]
-            rhs_arg = node.args[1]
-        else:
-            lhs_arg = node.kwargs.get("input")
-            rhs_arg = node.kwargs.get("other")
-        if lhs_arg is None or rhs_arg is None:
-            raise ValueError(f"Mul node {node.name} is missing inputs")
-        lhs_ref, lhs_scalar = _tensor_or_scalar_arg(lhs_arg, specs, node_name=node.name)
-        rhs_ref, rhs_scalar = _tensor_or_scalar_arg(rhs_arg, specs, node_name=node.name)
-        dst = _tensor_ref(node, specs)
-        if lhs_scalar is not None and rhs_scalar is not None:
-            raise ValueError(f"Mul node {node.name} has two scalar operands; unsupported.")
-        if lhs_scalar is not None or rhs_scalar is not None:
-            scalar = lhs_scalar if lhs_scalar is not None else rhs_scalar
-            tensor_ref = rhs_ref if lhs_scalar is not None else lhs_ref
-            if tensor_ref is None or scalar is None:
-                raise ValueError(f"Mul node {node.name} lacks tensor operand for scalar multiply")
-            return f"    mul_scalar_kernel({tensor_ref}, {dst}, {scalar:.6g}f);\n"
-        if lhs_ref is None or rhs_ref is None:
-            raise ValueError(f"Mul node {node.name} lacks tensor operands")
-        return f"    mul_kernel({lhs_ref}, {rhs_ref}, {dst});\n"
-    if node.target in ADD_TARGETS:
-        lhs, rhs, alpha = _add_operands(node, specs, scaled_mul)
-        dst = _tensor_ref(node, specs)
-        return f"    add_kernel({lhs}, {rhs}, {dst}, {alpha:.6g}f);\n"
-    if node.target in RELU_TARGETS:
-        src = _tensor_ref(_get_node_arg(node, 0), specs)
-        dst = _tensor_ref(node, specs)
-        return f"    relu_kernel({src}, {dst}, NULL);\n"
-    if node.target in CONV_TARGETS:
-        input_node = _get_node_arg(node, 0)
-        weight_node = node.args[1]
-        bias_node = node.args[2] if len(node.args) > 2 else node.kwargs.get("bias")
-        stride_h, stride_w = _as_pair(node.kwargs.get("stride", 1))
-        pad_h, pad_w = _as_pair(node.kwargs.get("padding", 0))
-        dil_h, dil_w = _as_pair(node.kwargs.get("dilation", 1))
-        groups = int(node.kwargs.get("groups", 1))
-        return (
-            f"    conv_kernel({_tensor_ref(input_node, specs)}, "
-            f"{_tensor_ref(weight_node, specs)}, {_tensor_ref_optional(bias_node, specs)}, "
-            f"{_tensor_ref(node, specs)}, {stride_h}, {stride_w}, {pad_h}, {pad_w}, "
-            f"{dil_h}, {dil_w}, {groups});\n"
-        )
-    if node.target in AVGPOOL_TARGETS:
-        input_node = _get_node_arg(node, 0)
-        kernel_h, kernel_w = _as_pair(node.kwargs.get("kernel_size", 1))
-        stride_h, stride_w = _as_pair(node.kwargs.get("stride", (kernel_h, kernel_w)))
-        pad_h, pad_w = _as_pair(node.kwargs.get("padding", 0))
-        return _format_avgpool_call(
-            _tensor_ref(input_node, specs),
-            _tensor_ref(node, specs),
-            (kernel_h, kernel_w),
-            (stride_h, stride_w),
-            (pad_h, pad_w),
-            global_pool=0,
-        )
-    return None
+    if alpha != 1.0:
+        raise _kernel_missing("add_alpha", node)
+    if lhs not in specs or rhs not in specs:
+        raise ValueError(f"Add node {node.name} operands missing tensor specs")
+    return lhs, rhs
 
 
 # Collect TensorSpec entries and lookup map for every bf16 tensor node.
 def _collect_tensor_specs(
-    gm: GraphModule, scaled_mul: Dict[Node, Tuple[Node, float]]
+    gm: GraphModule,
 ) -> Tuple[List[TensorSpec], Dict[Node, TensorSpec]]:
     tensor_specs: List[TensorSpec] = []
     specs_by_node: Dict[Node, TensorSpec] = {}
     for node in gm.graph.nodes:
-        if node.op == "output" or node in scaled_mul:
+        if node.op == "output":
             continue
         tensor_meta = node.meta.get("tensor_meta")
         if tensor_meta is None:
@@ -562,33 +313,386 @@ def _collect_tensor_specs(
     return tensor_specs, specs_by_node
 
 
-# Walk graph nodes in order and 'render' into calls
-def _render_kernel_calls(
+def _mat_dims_from_spec(spec: TensorSpec) -> Tuple[int, int, int, int]:
+    rank = len(spec.shape)
+    if rank == 1:
+        rows = 1
+        cols = int(spec.shape[-1])
+        row_tiles = 1
+        col_tiles = int(spec.tiles_per_dim[-1])
+    else:
+        rows = int(spec.shape[-2])
+        cols = int(spec.shape[-1])
+        row_tiles = int(spec.tiles_per_dim[-2])
+        col_tiles = int(spec.tiles_per_dim[-1])
+    return rows, cols, row_tiles, col_tiles
+
+
+# Build compile-time op plans.
+def _build_op_plans(
     gm: GraphModule,
     specs_by_node: Dict[Node, TensorSpec],
-    scaled_mul: Dict[Node, Tuple[Node, float]],
     attr_nodes: Dict[str, Node],
-) -> List[str]:
-    calls: List[str] = []
+) -> List[OpPlan]:
+    plans: List[OpPlan] = []
     for node in gm.graph.nodes:
-        if node in scaled_mul:
+        if node.op == "call_module":
+            module = gm.get_submodule(node.target)
+            if isinstance(module, torch.nn.Linear):
+                input_node = _get_node_arg(node, 0)
+                weight_attr = f"{node.target}.weight"
+                weight_node = attr_nodes.get(weight_attr)
+                if weight_node is None:
+                    raise ValueError(f"Missing get_attr node for {weight_attr}")
+                input_spec = specs_by_node[input_node]
+                weight_spec = specs_by_node[weight_node]
+                dst_spec = specs_by_node[node]
+                _, _, m_tiles, k_tiles = _mat_dims_from_spec(input_spec)
+                _, _, _, n_tiles = _mat_dims_from_spec(weight_spec)
+                plans.append(
+                    build_matmul_plan(
+                        node_name=node.name,
+                        lhs_shape=input_spec.shape,
+                        rhs_shape=weight_spec.shape,
+                        lhs_tiles=input_spec.tiles,
+                        rhs_tiles=weight_spec.tiles,
+                        dst_tiles=dst_spec.tiles,
+                        m_tiles=m_tiles,
+                        k_tiles=k_tiles,
+                        n_tiles=n_tiles,
+                        tile_size=TILE_HEIGHT,
+                    )
+                )
+
+                if module.bias is not None:
+                    bias_attr = f"{node.target}.bias"
+                    bias_node = attr_nodes.get(bias_attr)
+                    if bias_node is None:
+                        raise ValueError(f"Missing get_attr node for {bias_attr}")
+                    plans.append(
+                        build_add_plan(
+                            node_name=f"{node.name}_bias_add",
+                            lhs_tiles=specs_by_node[node].tiles,
+                            lhs_shape=specs_by_node[node].shape,
+                            lhs_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                            rhs_tiles=specs_by_node[bias_node].tiles,
+                            rhs_shape=specs_by_node[bias_node].shape,
+                            rhs_tiles_per_dim=specs_by_node[bias_node].tiles_per_dim,
+                            dst_tiles=specs_by_node[node].tiles,
+                            dst_shape=specs_by_node[node].shape,
+                            dst_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                            tile_size=TILE_HEIGHT,
+                        )
+                    )
+                continue
+            if isinstance(module, torch.nn.MaxPool2d):
+                input_node = _get_node_arg(node, 0)
+                kernel = _as_pair(module.kernel_size)
+                stride = module.stride if module.stride is not None else module.kernel_size
+                stride = _as_pair(stride)
+                padding = _as_pair(module.padding)
+                dilation = _as_pair(module.dilation)
+                ceil_flag = 1 if module.ceil_mode else 0
+                plans.append(
+                    build_maxpool_plan(
+                        node_name=node.name,
+                        src_tiles=specs_by_node[input_node].tiles,
+                        src_shape=specs_by_node[input_node].shape,
+                        src_tiles_per_dim=specs_by_node[input_node].tiles_per_dim,
+                        dst_tiles=specs_by_node[node].tiles,
+                        dst_shape=specs_by_node[node].shape,
+                        dst_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                        tile_size=TILE_HEIGHT,
+                        kernel=kernel,
+                        stride=stride,
+                        padding=padding,
+                        dilation=dilation,
+                        ceil_mode=ceil_flag,
+                    )
+                )
+                continue
+            if isinstance(module, torch.nn.AdaptiveAvgPool2d):
+                raise _kernel_missing("adaptive_avg_pool2d", node)
             continue
-        rendered = _render_call(gm, node, specs_by_node, scaled_mul, attr_nodes)
-        if rendered:
-            calls.append(rendered)
+
+        if node.op == "call_function" and node.target in MATMUL_TARGETS:
+            lhs_node = _get_node_arg(node, 0)
+            rhs_node = _get_node_arg(node, 1)
+            lhs_spec = specs_by_node[lhs_node]
+            rhs_spec = specs_by_node[rhs_node]
+            dst_spec = specs_by_node[node]
+            _, _, m_tiles, k_tiles = _mat_dims_from_spec(lhs_spec)
+            _, _, _, n_tiles = _mat_dims_from_spec(rhs_spec)
+            plans.append(
+                build_matmul_plan(
+                    node_name=node.name,
+                    lhs_shape=lhs_spec.shape,
+                    rhs_shape=rhs_spec.shape,
+                    lhs_tiles=lhs_spec.tiles,
+                    rhs_tiles=rhs_spec.tiles,
+                    dst_tiles=dst_spec.tiles,
+                    m_tiles=m_tiles,
+                    k_tiles=k_tiles,
+                    n_tiles=n_tiles,
+                    tile_size=TILE_HEIGHT,
+                )
+            )
+            continue
+        if node.op == "call_function" and node.target in RELU_TARGETS:
+            input_node = _get_node_arg(node, 0)
+            plans.append(
+                build_relu_plan(
+                    node_name=node.name,
+                    src_tiles=specs_by_node[input_node].tiles,
+                    src_shape=specs_by_node[input_node].shape,
+                    src_tiles_per_dim=specs_by_node[input_node].tiles_per_dim,
+                    dst_tiles=specs_by_node[node].tiles,
+                    dst_shape=specs_by_node[node].shape,
+                    dst_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                    tile_size=TILE_HEIGHT,
+                )
+            )
+            continue
+        if node.op == "call_method":
+            method = node.target.strip("'")
+            if method in VIEW_METHODS:
+                continue
+            if method == "mean":
+                raise _kernel_missing("mean", node)
+            continue
+        if node.op != "call_function":
+            continue
+        if node.target in IGNORED_FUNCTIONS:
+            continue
+        if node.op == "call_function" and node.target in SOFTMAX_TARGETS:
+            input_node = _get_node_arg(node, 0)
+            plans.append(
+                build_softmax_plan(
+                    node_name=node.name,
+                    src_tiles=specs_by_node[input_node].tiles,
+                    src_shape=specs_by_node[input_node].shape,
+                    src_tiles_per_dim=specs_by_node[input_node].tiles_per_dim,
+                    dst_tiles=specs_by_node[node].tiles,
+                    dst_shape=specs_by_node[node].shape,
+                    dst_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                    tile_size=TILE_HEIGHT,
+                )
+            )
+            continue
+        if node.op == "call_function" and node.target in MAXPOOL_TARGETS:
+            input_node = _get_node_arg(node, 0)
+            kernel = _as_pair(node.kwargs.get("kernel_size", 1))
+            stride = _as_pair(node.kwargs.get("stride", kernel))
+            padding = _as_pair(node.kwargs.get("padding", 0))
+            dilation = _as_pair(node.kwargs.get("dilation", 1))
+            ceil_flag = 1 if bool(node.kwargs.get("ceil_mode", False)) else 0
+            plans.append(
+                build_maxpool_plan(
+                    node_name=node.name,
+                    src_tiles=specs_by_node[input_node].tiles,
+                    src_shape=specs_by_node[input_node].shape,
+                    src_tiles_per_dim=specs_by_node[input_node].tiles_per_dim,
+                    dst_tiles=specs_by_node[node].tiles,
+                    dst_shape=specs_by_node[node].shape,
+                    dst_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                    tile_size=TILE_HEIGHT,
+                    kernel=kernel,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    ceil_mode=ceil_flag,
+                )
+            )
+            continue
+        if node.target in MUL_TARGETS:
+            raise _kernel_missing("mul", node)
+            continue
+        if node.target in ADD_TARGETS:
+            lhs_node, rhs_node = _add_operands(node, specs_by_node)
+            plans.append(
+                build_add_plan(
+                    node_name=node.name,
+                    lhs_tiles=specs_by_node[lhs_node].tiles,
+                    lhs_shape=specs_by_node[lhs_node].shape,
+                    lhs_tiles_per_dim=specs_by_node[lhs_node].tiles_per_dim,
+                    rhs_tiles=specs_by_node[rhs_node].tiles,
+                    rhs_shape=specs_by_node[rhs_node].shape,
+                    rhs_tiles_per_dim=specs_by_node[rhs_node].tiles_per_dim,
+                    dst_tiles=specs_by_node[node].tiles,
+                    dst_shape=specs_by_node[node].shape,
+                    dst_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                    tile_size=TILE_HEIGHT,
+                )
+            )
+            continue
+        if node.target in CONV_TARGETS:
+            input_node = _get_node_arg(node, 0)
+            weight_node = _get_node_arg(node, 1)
+            weight_spec = specs_by_node[weight_node]
+            weight_shape = weight_spec.shape
+            kernel = (1, 1)
+            if len(weight_shape) >= 2:
+                kernel = _as_pair(weight_shape[-2:])
+            stride = _as_pair(node.kwargs.get("stride", 1))
+            padding = _as_pair(node.kwargs.get("padding", 0))
+            dilation = _as_pair(node.kwargs.get("dilation", 1))
+            groups = int(node.kwargs.get("groups", 1))
+            plans.append(
+                build_conv_plan(
+                    node_name=node.name,
+                    src_tiles=specs_by_node[input_node].tiles,
+                    src_shape=specs_by_node[input_node].shape,
+                    src_tiles_per_dim=specs_by_node[input_node].tiles_per_dim,
+                    dst_tiles=specs_by_node[node].tiles,
+                    dst_shape=specs_by_node[node].shape,
+                    dst_tiles_per_dim=specs_by_node[node].tiles_per_dim,
+                    tile_size=TILE_HEIGHT,
+                    kernel=kernel,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=groups,
+                )
+            )
+            continue
+    return plans
+
+
+def _render_plan(plan: OpPlan) -> str:
+    lines: List[str] = ["    {\n"]
+    tile_info = plan.attrs.get("tile_info", {})
+    if not isinstance(tile_info, dict):
+        tile_info = {}
+
+    for step in plan.steps:
+        if step.kind is StepKind.RELEASE:
+            continue
+
+        if step.kind is StepKind.LOAD:
+            tile_id = step.attrs.get("tile_id")
+            if not isinstance(tile_id, str):
+                continue
+            info = tile_info.get(tile_id, {})
+            slot = int(step.attrs.get("slot", 0))
+            rows = int(info.get("rows", 1))
+            cols = int(info.get("cols", 1))
+            full_cols = int(info.get("full_cols", 1))
+            addr = int(info.get("addr", 0))
+            lines.append(
+                f"        scpad_load({slot} * ATALLA_TILE, 0x{addr:08X}, "
+                f"sdma_control({rows}, {cols}, {full_cols}));\n"
+            )
+            continue
+
+        if step.kind is StepKind.STORE:
+            tile_id = step.attrs.get("tile_id")
+            if not isinstance(tile_id, str):
+                continue
+            info = tile_info.get(tile_id, {})
+            slot = int(step.attrs.get("slot", 0))
+            rows = int(info.get("rows", 1))
+            cols = int(info.get("cols", 1))
+            full_cols = int(info.get("full_cols", 1))
+            addr = int(info.get("addr", 0))
+            lines.append(
+                f"        scpad_store({slot} * ATALLA_TILE, 0x{addr:08X}, "
+                f"sdma_control({rows}, {cols}, {full_cols}));\n"
+            )
+            continue
+
+        if step.kind is StepKind.COMPUTE:
+            if step.op == "matmul":
+                slot_a = int(step.attrs.get("slot_a", 0))
+                slot_b = int(step.attrs.get("slot_b", 1))
+                slot_c = int(step.attrs.get("slot_c", 2))
+                m_rows = int(step.attrs.get("m_rows", 1))
+                n_cols = int(step.attrs.get("n_cols", 1))
+                k_cols = int(step.attrs.get("k_cols", 1))
+                lines.append(
+                    f"        matmul_kernel({slot_a} * ATALLA_TILE, {slot_b} * ATALLA_TILE, "
+                    f"{slot_c} * ATALLA_TILE, {m_rows}, {n_cols}, {k_cols});\n"
+                )
+            elif step.op == "relu":
+                lines.append(
+                    f"        relu_kernel({int(step.attrs.get('slot_in', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('slot_out', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('rows', 1))}, {int(step.attrs.get('cols', 1))});\n"
+                )
+            elif step.op == "softmax":
+                lines.append(
+                    f"        softmax_kernel({int(step.attrs.get('slot_in', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('slot_out', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('rows', 1))}, {int(step.attrs.get('cols', 1))});\n"
+                )
+            elif step.op == "add":
+                lines.append(
+                    f"        add_kernel({int(step.attrs.get('slot_lhs', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('slot_rhs', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('slot_out', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('rows', 1))}, {int(step.attrs.get('cols', 1))});\n"
+                )
+            elif step.op == "maxpool":
+                lines.append(
+                    f"        maxpool_kernel({int(step.attrs.get('slot_in', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('slot_out', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('rows', 1))}, {int(step.attrs.get('cols', 1))}, "
+                    f"{int(step.attrs.get('kernel_h', 1))}, {int(step.attrs.get('kernel_w', 1))}, "
+                    f"{int(step.attrs.get('stride_h', 1))}, {int(step.attrs.get('stride_w', 1))}, "
+                    f"{int(step.attrs.get('pad_h', 0))}, {int(step.attrs.get('pad_w', 0))}, "
+                    f"{int(step.attrs.get('dilation_h', 1))}, {int(step.attrs.get('dilation_w', 1))}, "
+                    f"{int(step.attrs.get('ceil_mode', 0))});\n"
+                )
+            elif step.op == "conv":
+                lines.append(
+                    f"        conv_kernel({int(step.attrs.get('slot_in', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('slot_out', 0))} * ATALLA_TILE, "
+                    f"{int(step.attrs.get('rows', 1))}, {int(step.attrs.get('cols', 1))}, "
+                    f"{int(step.attrs.get('kernel_h', 1))}, {int(step.attrs.get('kernel_w', 1))}, "
+                    f"{int(step.attrs.get('stride_h', 1))}, {int(step.attrs.get('stride_w', 1))}, "
+                    f"{int(step.attrs.get('pad_h', 0))}, {int(step.attrs.get('pad_w', 0))}, "
+                    f"{int(step.attrs.get('dilation_h', 1))}, {int(step.attrs.get('dilation_w', 1))}, "
+                    f"{int(step.attrs.get('groups', 1))});\n"
+                )
+
+    lines.append("    }\n")
+    return "".join(lines)
+
+
+def _render_kernel_calls(op_plans: List[OpPlan]) -> List[str]:
+    calls: List[str] = []
+    for plan in op_plans:
+        if plan.op_type in {
+            "matmul",
+            "relu",
+            "softmax",
+            "maxpool",
+            "add",
+            "conv",
+        }:
+            calls.append(_render_plan(plan))
+            continue
+        for step in plan.steps:
+            if step.kind is not StepKind.COMPUTE:
+                continue
+            rendered = step.attrs.get("rendered_call")
+            if isinstance(rendered, str):
+                calls.append(rendered)
     return calls
 
 #main entry point 
 def emit(gm: GraphModule) -> str:
-    scaled_mul = _detect_scaled_args(gm)
     attr_nodes = {
         node.target: node
         for node in gm.graph.nodes
         if node.op == "get_attr"
     }
 
-    tensor_specs, specs_by_node = _collect_tensor_specs(gm, scaled_mul)
-    calls = _render_kernel_calls(gm, specs_by_node, scaled_mul, attr_nodes)
+    tensor_specs, specs_by_node = _collect_tensor_specs(gm)
+    raw_op_plans = _build_op_plans(gm, specs_by_node, attr_nodes)
+    op_plans: List[OpPlan] = []
+    for plan in raw_op_plans:
+        op_plans.append(plan_tile_moves(plan))
+    calls = _render_kernel_calls(op_plans)
 
     pieces: List[str] = [
         "#include \"kernels/kernels.h\"\n\n",
