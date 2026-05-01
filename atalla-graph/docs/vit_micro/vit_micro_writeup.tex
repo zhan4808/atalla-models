@@ -1,0 +1,133 @@
+% ViT-Micro on Atalla — team note + data dump (informal layout).
+% Build (from atalla-graph/):
+%   python3 docs/vit_micro/generate_writeup_figures.py
+%   cd docs/vit_micro && pdflatex vit_micro_writeup.tex   % run twice for longtable
+\documentclass[10pt,letterpaper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[document]{ragged2e}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{0pt}
+\setcounter{secnumdepth}{-1}
+
+% Flat section headings = same body size, left-aligned
+\titleformat{\section}{\bfseries\normalsize\RaggedRight}{}{0pt}{}
+\titlespacing*{\section}{0pt}{1.1ex plus .2ex}{0.5ex plus .1ex}
+
+% Captions: body-sized, left-aligned (not “report” centered blocks)
+\captionsetup{
+  font=normalsize,
+  labelfont=bf,
+  format=plain,
+  justification=raggedright,
+  singlelinecheck=false,
+}
+\captionsetup[subfigure]{
+  font=normalsize,
+  labelfont=bf,
+  justification=raggedright,
+  singlelinecheck=false,
+}
+
+\begin{document}
+\RaggedRight
+
+% Title block: same size as body, no centered title page
+\noindent\textbf{ViT-Micro on Atalla — measured schedule, DMA, instruction mix}\\
+\textit{Team notes, April 2026}
+\medskip
+
+\noindent\textbf{Summary.}\ 
+We report static and dynamic metrics for ViT-Micro ($B{=}1$, $T{=}32$, $D{=}32$) from \texttt{run\_graph.py} validate plus the functional simulator: schedule sparsity, SDMA bytes, retired-instruction mix by mnemonic class, and per-layer cosines vs.\ BF16 PyTorch.
+\textit{Chained} means tensors move through Python's \texttt{activation\_cache} so each emulated op sees the previous emulator output. Attention is \texttt{atalla\_sdpa} with \texttt{ATALLA\_SDPA\_FLASH=1}: the fused flash kernel is compiled and run on the functional sim---there is no NumPy or PyTorch attention substitute in this path. NumPy short-circuits the emulator for \texttt{gelu} (vector-lane limit) and, with the default \texttt{ATALLA\_FFN\_ADD\_NUMPY=1}, for the 2048-wide FFN bias \texttt{add} after the hidden projection; set \texttt{ATALLA\_FFN\_ADD\_NUMPY=0} to force the AtallaC add image for that layer (known mismatch vs.\ ref on the current sim for that shape). Residual and other $1024$-element adds use the C kernel.
+We tag claims as Tier~1 (simulator counts), Tier~2 (bytes + SP0/SP1 naming for GEMM CSV columns), or off-paper sketches---Tier~3 tiling art is out of this PDF.
+The main empirical punch is the scalar-heavy retired-instruction mix (Table~\ref{tab:retire-mix}) plus brutal static schedule sparsity (Tables~\ref{tab:schedule-aggregate}--\ref{tab:slot-hist}).
+
+\medskip
+\noindent\textbf{Pipeline (how to read the tables).}\ 
+PyTorch FX is lowered in \texttt{run\_graph.py}; supported ops emit C, compile through AtallaC $\rightarrow$ assembly $\rightarrow$ \texttt{build\_compiler.compile\_asm} (\texttt{schedule\_program} packs VLIW rows), and the functional simulator runs the \texttt{.in} image. Regenerate the artifacts and this PDF with (from \texttt{atalla-graph/}):
+\texttt{ATALLA\_SDPA\_FLASH=1 python3 run\_graph.py --model vit\_micro --mode validate --validate-inputs chained}
+\texttt{--metrics-json out/graph/vit\_micro\_metrics.json --layer-metrics-csv out/graph/vit\_micro\_layer\_metrics.csv}
+then \texttt{python3 docs/vit\_micro/generate\_writeup\_figures.py} and \texttt{pdflatex} as in the header comment.
+Metrics land in \texttt{out/graph/vit\_micro\_metrics.json} and \texttt{out/graph/vit\_micro\_layer\_metrics.csv} after validate.
+
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item \textbf{Tier~1:} packet/slot stats from the static image; dynamic packets + retired ops from the sim; SDMA bytes; FLOP model; per-layer cosines on emulated nodes.
+  \item \textbf{Tier~2:} CSV \texttt{reuse\_R\_A\_gemm}/\texttt{reuse\_R\_W\_gemm} only mean $A$/$W$ if the emitted kernel matches that bank story---check each \texttt{.c}.
+  \item Table~\ref{tab:schedule-aggregate} last row and per-node $\mathrm{AI}_{\mathrm{ld}}$ are model ratios (FLOPs / SDMA bytes), not hardware roofline AI.
+\end{itemize}
+
+\section{Findings}
+
+\medskip
+\noindent\textbf{Retired instructions} (Table~\ref{tab:retire-mix}).\ 
+Scalar ALU + scalar GMEM dominate dynamic retirements; GEMM/systolic is a few percent---so today’s compiled kernels burn most committed ISA slots on scalar bookkeeping and scalar memory, not the MAC array. Buckets come from \texttt{misc/instruction\_retire.py} (mnemonic classes), not a PMU.
+
+\input{vit_micro_writeup_table_retire.tex}
+
+\medskip
+\noindent\textbf{Static schedule} (Tables~\ref{tab:schedule-aggregate}, \ref{tab:slot-hist}).\ 
+Most static packet rows are empty of real ops before NOP fill; on rows with $\geq 1$ real op, mean slot fill is still $\sim$27\% (Table~\ref{tab:schedule-aggregate})---order one live op per four-slot row.
+At most one vector + one memory op per packet, and control takes whole rows, so “heavy” co-issue in a mixed row has a rough 50\% structural ceiling; observed $\sim$27\% is already below that, so not all slack is “the ISA’s fault.” We don’t split forced vs.\ schedulable gap here.
+Table~\ref{tab:slot-hist} is the histogram of real-op counts per static row.
+
+\input{vit_micro_writeup_table_schedule.tex}
+
+\medskip
+\noindent\textbf{Templates, DMA, retire mix} (Figures~\ref{fig:concentration}, \ref{fig:instr-mix}).\ 
+Fig.~\ref{fig:template}: cumulative dynamic packet share by template (fused SDPA $\sim$54\% of dynamic packets in a typical flash run; LayerNorm and $32{\times}32{\times}32$ GEMMs split most of the remainder).
+Fig.~\ref{fig:dma}: SDMA bytes per node (attention and FFN GEMMs dominate at this scale).
+Fig.~\ref{fig:instr-mix}: same buckets as Table~\ref{tab:retire-mix} per template; LN leans vector-ALU vs.\ GEMM shapes, in line with higher $\eta_{\mathrm{st}}$ on LN rows in Table~\ref{tab:per-layer}.
+
+\begin{figure}[H]
+  \noindent
+  \begin{subfigure}[t]{0.49\linewidth}
+    \includegraphics[width=\linewidth]{fig_template_rollup.pdf}
+    \caption{Dynamic packet share by template.}
+    \label{fig:template}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.49\linewidth}
+    \includegraphics[width=\linewidth]{fig_dma_bytes_by_layer.pdf}
+    \caption{DMA bytes (loads + stores) per node.}
+    \label{fig:dma}
+  \end{subfigure}
+  \caption{Measured concentration (Tier~1).}
+  \label{fig:concentration}
+\end{figure}
+
+\begin{figure}[H]
+  \noindent\includegraphics[width=0.88\linewidth]{fig_template_instruction_mix.pdf}
+  \caption{Measured. Retired-op mix by template.}
+  \label{fig:instr-mix}
+\end{figure}
+
+\medskip
+\noindent\textbf{Per-node} (Table~\ref{tab:per-layer}).\ 
+Per-op cosines vs.\ BF16 ref are high for most emulated nodes; the chained end-to-end cosine is dominated by attention and the wide FFN stages (GELU $+$ optional NumPy bias add) and is $\sim$0.98 in a typical \texttt{ATALLA\_SDPA\_FLASH=1} run with the default NumPy GELU and FFN add paths (see validate console \texttt{cos=})---not a tight ``paper'' match without tightening those paths.
+$\eta_{\mathrm{st}}$ is $\sim$28\% on this run; LayerNorm blocks differ from pure GEMM templates in vector vs.\ scalar retire mix (Table~\ref{fig:instr-mix}), not from higher MAC throughput.
+
+\input{vit_micro_writeup_table_per_layer.tex}
+\footnotetext{Tier~2: CSV \texttt{reuse\_R\_A\_gemm}/\texttt{reuse\_R\_W\_gemm} map SP0/SP1 loads to $A$/$W$ by emitter convention only; audit each \texttt{.c} before reuse claims.}
+
+\section{Scope and next steps}
+
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item \textbf{Scale:} $T{=}D{=}32$ is still toy vs.\ real ViT shapes---don’t extrapolate without re-running.
+  \item \textbf{Compiler:} scalar retirements + scalar GMEM (Table~\ref{tab:retire-mix}); slot slack vs.\ structure (Table~\ref{tab:schedule-aggregate}).
+  \item \textbf{Validation:} bring GELU and/or the 2048-wide FFN add fully on-chip for stricter chained E2E; flash SDPA already runs on the sim. Audit SP0/SP1 per GEMM before trusting \texttt{reuse\_R\_*\_gemm}.
+  \item \textbf{Instrumentation:} split non-empty-row waste; optional Tier~2 pass over emitted \texttt{.c}.
+  \item Tier~3 tiling slides live elsewhere unless tied to new counters.
+\end{itemize}
+
+\end{document}

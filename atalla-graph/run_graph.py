@@ -34,7 +34,7 @@ from typing import Dict, FrozenSet, Optional, Set
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.fx import symbolic_trace
+from torch.fx import GraphModule, Tracer, symbolic_trace
 from torch.fx.passes.shape_prop import ShapeProp
 
 _FUNC_SIM = Path(__file__).resolve().parent.parent / "functional_sim"
@@ -53,6 +53,7 @@ from graph.lower_modules import lower_linear_modules
 from graph.memoryallocator import allocate_memory
 from graph.fx_capture import normalize_ops, get_node_shape
 from graph.tile_planner import plan_tiles
+from model.atalla_ops import AtallaSdpa
 from scripts.generate_schedule import emit as emit_schedule
 from codegen.c_emitter import (
     emit_node, render_in_file, compile_and_assemble, LayerEmission, _to_bf16_array,
@@ -67,8 +68,25 @@ DEFAULT_KERNEL_BUNDLE_OPS: FrozenSet[str] = frozenset(
 
 # Ops that run in the emulator; oracle mode refreshes activations from PyTorch refs before emit.
 _EMU_ATALLA_OPS: FrozenSet[str] = frozenset(
-    {"conv", "relu", "maxpool", "matmul", "add", "layernorm", "gelu"}
+    {
+        "conv",
+        "relu",
+        "maxpool",
+        "matmul",
+        "add",
+        "mul",
+        "layernorm",
+        "gelu",
+        "atalla_sdpa",
+    }
 )
+
+
+class _AtallaLeafTracer(Tracer):
+    """Keep AtallaSdpa as one FX node (fused attention); trace other submodules as usual."""
+
+    def is_leaf_module(self, m: nn.Module, module_qualified_name: str) -> bool:
+        return isinstance(m, AtallaSdpa)
 
 
 def bf16_to_f32(bits: int) -> float:
@@ -247,7 +265,12 @@ def build_graph(model: nn.Module, example_input: torch.Tensor,
 
     if verbose:
         print("FX trace + lower modules...")
-    gm = symbolic_trace(model)
+    if any(isinstance(m, AtallaSdpa) for m in model.modules()):
+        fx_tr = _AtallaLeafTracer()
+        graph = fx_tr.trace(model)
+        gm = GraphModule(model, graph)
+    else:
+        gm = symbolic_trace(model)
     gm = lower_linear_modules(gm)
 
     if verbose:
@@ -282,6 +305,14 @@ def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
             print(f"  {k[:100]}")
         if len(kernel_calls) > 8:
             print(f"  ... ({len(kernel_calls) - 8} more)")
+        n_mm = c_code.count("matmul_kernel(")
+        if n_mm == 0:
+            print(
+                "  Note: F.linear in recent PyTorch FX traces is lowered in "
+                "``lower_linear_modules`` to matmul+add so matmul_kernel appears. "
+                "``layer_norm``, ``gelu``, and fused ``AtallaSdpa`` are not yet "
+                "emitted in graph_schedule.c (TBD; schedule is partial vs validate)."
+            )
     return c_code
 
 
@@ -299,6 +330,10 @@ def run_validate(
     metrics_json_path: Optional[str] = None,
     layer_metrics_csv_path: Optional[str] = None,
     validate_inputs: str = "chained",
+    strict_end_to_end: bool = False,
+    strict_min_cos: float = 0.999,
+    strict_max_rel_l2: float = 0.02,
+    strict_max_relmax: float = 0.05,
 ) -> Dict:
     """Per-node compile → emulate → compare vs PyTorch golden.
 
@@ -318,6 +353,11 @@ def run_validate(
     ``kernel_bundle_ops`` (default: conv, relu, maxpool, matmul, add) copies
     ``.c`` / ``.s`` / ``.in``, and ``verify.json`` (metrics)
     into a subdirectory.
+
+    If *strict_end_to_end* is true and *validate_inputs* is *chained*, the
+    result includes *strict_fail_reasons* when the final output violates
+    *strict_min_cos* / *strict_max_rel_l2* / *strict_max_relmax* (defaults for
+    a meaningful E2E error bar, not direction-only cos).
     """
     if validate_inputs not in ("chained", "oracle"):
         raise ValueError("validate_inputs must be 'chained' or 'oracle'")
@@ -601,9 +641,27 @@ def run_validate(
 
     aggregate_metrics = _aggregate_kernel_metrics(kernel_metrics)
 
+    end_to_end: Optional[Dict] = None
+    strict_fail_reasons: list = []
     if emu_out is not None and ref_out is not None:
         end_cmp = _layer_compare_metrics(ref_out, emu_out)
+        end_to_end = end_cmp
         cos = end_cmp["cos_sim"]
+        rl2 = end_cmp["rel_l2_error"]
+        rmx = end_cmp["rel_max_abs_error"]
+        if strict_end_to_end and validate_inputs == "chained":
+            if cos < strict_min_cos:
+                strict_fail_reasons.append(
+                    f"cos {cos:.6f} < {strict_min_cos} (min)"
+                )
+            if rl2 > strict_max_rel_l2:
+                strict_fail_reasons.append(
+                    f"rel_l2 {rl2:.6f} > {strict_max_rel_l2} (max)"
+                )
+            if rmx > strict_max_relmax:
+                strict_fail_reasons.append(
+                    f"relmax {rmx:.6f} > {strict_max_relmax} (max)"
+                )
         if verbose:
             print(f"  Output: emu={emu_out.shape} ref={ref_out.shape}")
             print(
@@ -611,19 +669,36 @@ def run_validate(
                 f"relmax={end_cmp['rel_max_abs_error']:.6f}  "
                 f"rmse={end_cmp['rmse']:.6f}  rel_l2={end_cmp['rel_l2_error']:.6f}"
             )
-            if validate_inputs == "oracle" and cos > 0.95:
-                print(
-                    "  PASS (output cos threshold) — in oracle mode, scan "
-                    "per-layer relmax/rmse for kernels that still disagree."
-                )
-            elif cos > 0.95:
-                print("  PASS (cos threshold)")
+            if strict_end_to_end and validate_inputs == "chained":
+                if strict_fail_reasons:
+                    print(
+                        "  FAIL (strict chained end-to-end: cos + rel_l2 + relmax):\n  - "
+                        + "\n  - ".join(strict_fail_reasons)
+                    )
+                else:
+                    print(
+                        f"  PASS (strict: cos≥{strict_min_cos}, "
+                        f"rel_l2≤{strict_max_rel_l2}, relmax≤{strict_max_relmax})"
+                    )
+            else:
+                if validate_inputs == "oracle" and cos > 0.95:
+                    print(
+                        "  RELAXED PASS (cos>0.95) — in oracle mode, prefer rel_l2/relmax; "
+                        "per-layer can still be poor."
+                    )
+                elif cos > 0.95:
+                    print(
+                        "  RELAXED PASS (cos>0.95 only) — for chained E2E, use "
+                        "--strict-end or inspect rel_l2/relmax above."
+                    )
             if validate_inputs == "oracle":
                 print(
                     "\n  Oracle caveat: inputs are reset from PyTorch before each "
                     "emulated op, so the last add can be exact even when matmul "
                     "outputs vs ref are poor."
                 )
+    elif strict_end_to_end and validate_inputs == "chained":
+        strict_fail_reasons.append("missing reference or emulator output for strict check")
 
     if verbose:
         am = aggregate_metrics
@@ -643,6 +718,13 @@ def run_validate(
         "aggregate_metrics": aggregate_metrics,
         "emulator_output": emu_out,
         "reference_output": ref_out,
+        "end_to_end": end_to_end,
+        "strict_end_to_end": bool(strict_end_to_end),
+        "strict_pass": (
+            (not strict_fail_reasons) if (strict_end_to_end and validate_inputs == "chained")
+            else None
+        ),
+        "strict_fail_reasons": strict_fail_reasons,
     }
     if metrics_json_path:
         Path(metrics_json_path).parent.mkdir(parents=True, exist_ok=True)
@@ -699,8 +781,9 @@ def load_model(name: str, scale: float = 0.01):
         return LayerNormSmoke(dim=32), torch.randn(1, 32)
     elif name == "vit_micro":
         from model.vit_micro import ViTMicro
-        m = ViTMicro(dim=32, n_tokens=4)
-        return m, torch.randn(1, 4, 32)
+        # n_tokens=dim=32 matches kernels/flash_sdpa_n32d32.c (fused attention on emulator).
+        m = ViTMicro(dim=32, n_tokens=32)
+        return m, torch.randn(1, 32, 32)
     else:
         raise ValueError(f"Unknown model: {name}")
 
@@ -749,6 +832,14 @@ def main():
             "per-layer output still vs ref, but final output can match even if matmuls do not."
         ),
     )
+    parser.add_argument(
+        "--strict-end",
+        action="store_true",
+        help=(
+            "Chained-validate: exit non-zero if final cos < 0.999, rel_l2 > 0.02, "
+            "or relmax > 0.05. Use for paper-style E2E; relaxed PASS only without this."
+        ),
+    )
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -759,8 +850,9 @@ def main():
 
     gm = build_graph(model, example_input, verbose=verbose)
 
+    vout: Optional[Dict] = None
     if args.mode in ("validate", "both"):
-        run_validate(
+        vout = run_validate(
             gm,
             model,
             example_input,
@@ -770,7 +862,10 @@ def main():
             metrics_json_path=args.metrics_json,
             layer_metrics_csv_path=args.layer_metrics_csv,
             validate_inputs=args.validate_inputs,
+            strict_end_to_end=bool(args.strict_end),
         )
+    if vout and vout.get("strict_pass") is False:
+        sys.exit(1)
 
     if args.mode in ("schedule", "both"):
         import copy

@@ -11,4 +11,5 @@ from .relu import relu_c
 from .softmax import softmax_c, softmax_c_batched
 from .maxpool import maxpool_c
 from .add import add_c
+from .mul import mul_c
 from .layernorm import layernorm_c

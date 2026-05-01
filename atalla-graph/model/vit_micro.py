@@ -1,7 +1,8 @@
-"""Minimal ViT-style stack: LayerNorm, single-head attention (matmul+softmax), GELU FFN.
+"""Minimal ViT-style stack: LayerNorm, single-head attention, GELU FFN.
 
-Shapes are chosen so LayerNorm uses the AtallaC path (``D % 32 == 0``): ``dim=32``,
-``n_tokens=4``. Example input: ``(1, 4, 32)`` — treat as patch tokens after embedding.
+LayerNorm needs ``dim % 32 == 0``. Attention is ``atalla_sdpa`` (graph leaf); the
+fused flash kernel in the emitter matches ``n_tokens=dim=32`` (input ``(1, 32, 32)``) when
+``ATALLA_SDPA_FLASH=1``. Other shapes use a reference path in validate until a parameterized kernel exists.
 """
 
 from __future__ import annotations
@@ -12,9 +13,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model.atalla_ops import AtallaSdpa
+
 
 class ViTMicro(nn.Module):
-    def __init__(self, dim: int = 32, n_tokens: int = 4):
+    def __init__(self, dim: int = 32, n_tokens: int = 32):
         super().__init__()
         if dim % 32 != 0:
             raise ValueError("ViTMicro uses dim divisible by 32 for hardware LayerNorm.")
@@ -31,7 +34,7 @@ class ViTMicro(nn.Module):
         hidden = dim * 2
         self.ff1 = nn.Linear(dim, hidden)
         self.ff2 = nn.Linear(hidden, dim)
-        self.scale = 1.0 / math.sqrt(float(dim))
+        self.sdpa = AtallaSdpa(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, N, D)
@@ -40,9 +43,7 @@ class ViTMicro(nn.Module):
         q = self.q_proj(xa)
         k = self.k_proj(xa)
         v = self.v_proj(xa)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(scores, dim=-1)
-        mixed = torch.matmul(attn, v)
+        mixed = self.sdpa(q, k, v)
         x = x + self.attn_proj(mixed)
         xb = self.ln2(x)
         h = self.ff1(xb)

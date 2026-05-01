@@ -4,7 +4,36 @@ Generates parameterized AtallaC that uses the same ADDR_TABLE / DRAM layout
 conventions as asm_emitter.py, but outputs .c files for the ppci compiler
 instead of raw assembly.
 
-Pipeline: .c -> ppci atalla_cc -> .s -> build_compiler.compile_asm -> .in
+**Where scheduling / packetization actually live (verified stack)**
+
+1. **Atalla-graph** — Graph-level work: tiling, memory allocation, lowering FX nodes
+   to kernel calls or AtallaC. That is **op / kernel ordering**, not VLIW packets.
+   ``scripts/generate_schedule`` emits a **sequential C** file that calls kernels in
+   graph order; it does not emit instruction packets.
+
+2. **PPCI (``ppci atalla_cc``)** — IR → assembly text ``.s``. The backend may emit
+   **four-wide groups** from ``buckets_by_block`` (``_emit_packets_from_buckets``) when
+   that schedule structure exists; otherwise it emits a **linear** instruction list.
+   That compiler-side grouping is **not** the same pass as ``build_compiler``'s
+   latency + port rules, and it is **not** what the functional simulator runs as a
+   separate “second scheduler.”
+
+3. **``build_compiler.compile_asm``** (lives under ``functional_sim/`` but runs at
+   **assemble time**, before emulation) — Parses ``.s``, then ``schedule_program``:
+   uses ``instruction_latency``\ -based readiness and **structural VLIW constraints**
+   (e.g. ≤1 vector mem op per packet, ≤1 scalar LSU mem op per packet, RAW/WAR/WAW
+   within a packet, control flow alone in its packet). It **packs** instructions into
+   the final packet rows and **encodes** the ``.in`` instruction section. This is the
+   authoritative static schedule for the image the emulator loads.
+
+4. **``functional_sim.run``** — Loads the **already packetized** image, advances ``PC``
+   one **packet row** at a time, ``decode_packet`` splits the row into slots, and
+   executes them. It does **not** re-run a latency scheduler; it replays the static
+   schedule. (Some Python **kernel builders** optionally use ``greedy_pack`` + a DAG as
+   an alternate path to packet rows; that is still **before** ``run``, not inside it.)
+
+So: **latency-aware VLIW packing = ``build_compiler``**; **execution = functional_sim**
+with **no** second scheduler in the decode loop.
 """
 from __future__ import annotations
 
@@ -22,8 +51,10 @@ import torch
 from torch.fx import GraphModule, Node
 
 _FUNC_SIM = Path(__file__).resolve().parent.parent.parent / "functional_sim"
-if str(_FUNC_SIM) not in sys.path:
-    sys.path.insert(0, str(_FUNC_SIM))
+_FUNC_KERNELS = _FUNC_SIM / "kernels"
+for _p in (_FUNC_SIM, _FUNC_KERNELS):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 
 def _load_emit_kernels():
@@ -53,6 +84,7 @@ _softmax_c = _ek.softmax_c
 _softmax_c_batched = _ek.softmax_c_batched
 _maxpool_c = _ek.maxpool_c
 _add_c = _ek.add_c
+_mul_c = _ek.mul_c
 _layernorm_c = _ek.layernorm_c
 
 _default_compiler = Path(__file__).resolve().parent.parent.parent / "aihw-ppci-compiler"
@@ -76,6 +108,33 @@ def _get_module(gm: GraphModule, target: str):
     for p in parts:
         mod = getattr(mod, p)
     return mod
+
+
+def _fmt_plan_dram(maybe: object) -> str:
+    if isinstance(maybe, int):
+        return f"0x{maybe:x} ({maybe})"
+    return repr(maybe)
+
+
+def _emit_addr_debug(phase: str, node: Node, **kwargs: object) -> None:
+    """Set ATALLA_EMIT_ADDR_DEBUG=1 to compare per-kernel GMEM vs tile_planner dram_addr.
+
+    In ``run_graph`` validate, each .in is independent: the previous op's result is
+    read into ``activation_cache``, then the next op **re-encodes** that tensor at
+    its own A_GMEM (e.g. 0x1000 for linear). The planner's ``node.meta['dram_addr']``
+    is for the unified schedule / ``allocate_memory`` path, not the address inside
+    each per-node kernel image.
+    """
+    v = os.environ.get("ATALLA_EMIT_ADDR_DEBUG", "").strip().lower()
+    if v not in ("1", "true", "yes", "y"):
+        return
+    pl = _fmt_plan_dram(node.meta.get("dram_addr", "?"))
+    parts = [f"[ATALLA_EMIT_ADDR_DEBUG] {phase}", f"node={node.name!r}", f"this_node_plan={pl}"]
+    for k, val in kwargs.items():
+        if k.endswith("plan_dram") and isinstance(val, int):
+            val = _fmt_plan_dram(val)
+        parts.append(f"{k}={val!r}")
+    print("  ".join(parts), flush=True)
 
 
 class LayerEmission:
@@ -154,6 +213,8 @@ def _write_gemm_rhs_weight(img: DRAMWriter, base_addr: int, w_kn: np.ndarray) ->
 
     Stored as ``W.T`` row-major (``N`` × ``K``), each row zero-padded to
     ``_gemm_k_stride(K)`` so SDMA can fetch ``tile_n`` lanes when ``K < TILE``.
+    Must stay consistent with the generated C kernel’s SDMA + ``lw.vi`` order and the
+    column-stationary buffer contract in ``functional_sim`` / ``gemm.py``.
     """
     w = np.asarray(w_kn, dtype=np.float32)
     k, n = w.shape
@@ -335,6 +396,22 @@ def emit_linear(node: Node, gm: GraphModule,
     em.output_shape = out_shape if out_shape else (M, N)
     em.output_elements = M * N
     em.layer_metrics = _gemm_map_metrics(M, N, K, kind="gemm")
+    if isinstance(node.args[0], Node):
+        pr = node.args[0]
+        in_plan = pr.meta.get("dram_addr", "?")
+        in_plan_s = _fmt_plan_dram(in_plan) if isinstance(in_plan, int) else repr(in_plan)
+        _emit_addr_debug(
+            "linear/gemm",
+            node,
+            A_GMEM_input_buffer=f"0x{A_GMEM:x}",
+            C_GMEM_output=f"0x{C_GMEM:x}",
+            input_fx_name=pr.name,
+            input_node_plan_dram=in_plan_s,
+            note=(
+                "A is filled from activation_cache; not wired to sdpa flash O(0x7000) in-image. "
+                "0x5000 here is C_GMEM output for this matmul, not V buffer."
+            ),
+        )
     return em
 
 
@@ -589,7 +666,13 @@ def emit_maxpool(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
     return em
 
 
-def emit_mul(node: Node, activation_cache: Dict[str, np.ndarray]) -> LayerEmission:
+def emit_mul(
+    node: Node, activation_cache: Dict[str, np.ndarray], tc: TileConfig
+) -> LayerEmission:
+    p = tc.params
+    total = int(p.get("total_elements", 1))
+    width = min(total, TILE)
+
     lhs_arg = node.args[0]
     rhs_arg = node.args[1]
 
@@ -607,18 +690,178 @@ def emit_mul(node: Node, activation_cache: Dict[str, np.ndarray]) -> LayerEmissi
     else:
         rhs = np.ones(1, dtype=np.float32)
 
-    em = LayerEmission()
-    em.skip_emulator = True
-    result = (lhs.flatten() * rhs.flatten()).astype(np.float32)
+    a_flat = lhs.flatten()
+    b_flat = rhs.flatten()
+    if len(b_flat) < len(a_flat):
+        b_flat = np.resize(b_flat, a_flat.shape)
+    elif len(a_flat) < len(b_flat):
+        a_flat = np.resize(a_flat, b_flat.shape)
+    a_flat = a_flat[:total]
+    b_flat = b_flat[:total]
+
+    rows = math.ceil(total / width)
+    A_GMEM = 0x1000
+    B_GMEM = A_GMEM + _align_data(rows * width * 2)
+    C_GMEM = B_GMEM + _align_data(rows * width * 2)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, A_GMEM)
+    img.u32(ADDR_TABLE + 4, B_GMEM)
+    img.u32(ADDR_TABLE + 8, C_GMEM)
+
+    padded_a = np.zeros(rows * width, dtype=np.float32)
+    padded_b = np.zeros(rows * width, dtype=np.float32)
+    padded_a[: len(a_flat)] = a_flat
+    padded_b[: len(b_flat)] = b_flat
+    for i in range(rows * width):
+        img.bf16(A_GMEM + i * 2, float(padded_a[i]))
+        img.bf16(B_GMEM + i * 2, float(padded_b[i]))
+
     out_shape = get_node_shape(node)
-    em.numpy_result = result.reshape(out_shape) if out_shape else result
-    em.output_shape = out_shape if out_shape else result.shape
-    em.output_elements = result.size
+    os2 = out_shape if out_shape else (total,)
+
+    em = LayerEmission()
+    em.c_source = _mul_c(total, width)
+    em.dram = img
+    em.output_addr = C_GMEM
+    em.output_shape = os2
+    em.output_elements = total
+    em.layer_metrics = {
+        "map_kind": "mul",
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "bytes_est_a": int(rows * width * 2),
+        "bytes_est_b": int(rows * width * 2),
+        "bytes_est_out": int(rows * width * 2),
+    }
+    return em
+
+
+def emit_sdpa(
+    node: Node,
+    gm: GraphModule,
+    activation_cache: Dict[str, np.ndarray],
+    tc: TileConfig,
+) -> LayerEmission:
+    """Fused attention: hardware image when N=D=32, B=1; else BF16 reference."""
+    p = tc.params
+    b = int(p.get("B", 1))
+    n = int(p.get("N", 1))
+    d = int(p.get("D", 1))
+    use_flash = bool(p.get("use_flash", False))
+    inv = float(p.get("inv_sqrt_d", 1.0 / (d ** 0.5)))
+
+    if len(node.args) < 3:
+        em = LayerEmission()
+        em.skip_emulator = True
+        em.numpy_result = np.zeros((b, n, d), dtype=np.float32)
+        em.output_shape = (b, n, d)
+        em.output_elements = b * n * d
+        return em
+
+    qn, kn, vn = node.args[0], node.args[1], node.args[2]
+    if not (
+        isinstance(qn, Node)
+        and isinstance(kn, Node)
+        and isinstance(vn, Node)
+        and qn.name in activation_cache
+        and kn.name in activation_cache
+        and vn.name in activation_cache
+    ):
+        em = LayerEmission()
+        em.skip_emulator = True
+        em.numpy_result = np.zeros((b, n, d), dtype=np.float32)
+        em.output_shape = (b, n, d)
+        em.output_elements = b * n * d
+        return em
+
+    qf = np.asarray(activation_cache[qn.name], dtype=np.float32).reshape(b, n, d)
+    kf = np.asarray(activation_cache[kn.name], dtype=np.float32).reshape(b, n, d)
+    vf = np.asarray(activation_cache[vn.name], dtype=np.float32).reshape(b, n, d)
+
+    tq = torch.from_numpy(qf).to(torch.bfloat16)
+    tk = torch.from_numpy(kf).to(torch.bfloat16)
+    tv = torch.from_numpy(vf).to(torch.bfloat16)
+    s = (tq @ tk.transpose(-2, -1)) * inv
+    pr = torch.nn.functional.softmax(s.float(), dim=-1)
+    ref = (pr @ tv.float()).numpy()
+
+    if not use_flash or b != 1:
+        em = LayerEmission()
+        em.skip_emulator = True
+        em.numpy_result = ref
+        em.output_shape = (b, n, d)
+        em.output_elements = b * n * d
+        em.layer_metrics = {
+            "map_kind": "atalla_sdpa",
+            "map_B": b,
+            "map_N": n,
+            "map_D": d,
+            "use_flash": False,
+        }
+        _emit_addr_debug(
+            "sdpa(numpy ref)",
+            node,
+            output_gmem="(no kernel image; skip_emulator)",
+            readback_addr="(n/a)",
+        )
+        return em
+
+    c_path = Path(__file__).resolve().parent.parent / "kernels" / "flash_sdpa_n32d32.c"
+    c_source = c_path.read_text()
+    scale_addr = 0x0C00
+    q_addr, k_addr, v_addr, o_addr = 0x1000, 0x3000, 0x5000, 0x7000
+    img = DRAMWriter()
+    img.f32(scale_addr, inv)
+    # K scratchpad in flash kernel is consumed column-wise; layout matches
+    # functional_sim contract_flash: row-major of K with matmul (Q @ K^T) — same
+    # storage as aihw-ppci flash test (K at 0x3000 as (N,D) in row order).
+    for i, val in enumerate(qf[0].reshape(-1)):
+        img.bf16(q_addr + i * 2, float(val))
+    for i, val in enumerate(kf[0].reshape(-1)):
+        img.bf16(k_addr + i * 2, float(val))
+    for i, val in enumerate(vf[0].reshape(-1)):
+        img.bf16(v_addr + i * 2, float(val))
+    for i in range(n * d):
+        img.bf16(o_addr + i * 2, 0.0)
+
+    em = LayerEmission()
+    em.c_source = c_source
+    em.dram = img
+    em.output_addr = o_addr
+    em.output_shape = (1, n, d)
+    em.output_elements = n * d
+    nelem = n * d
+    em.layer_metrics = {
+        "map_kind": "atalla_sdpa",
+        "map_B": 1,
+        "map_N": n,
+        "map_D": d,
+        "use_flash": True,
+        "bytes_est_in": int(3 * nelem * 2 + 4),
+        "bytes_est_out": int(nelem * 2),
+    }
+    _emit_addr_debug(
+        "sdpa(flash C)",
+        node,
+        Q_GMEM=f"0x{q_addr:x}",
+        K_GMEM=f"0x{k_addr:x}",
+        V_GMEM=f"0x{v_addr:x}",
+        output_O_GMEM=f"0x{o_addr:x}",
+        note="run_validate readback uses output_O_GMEM; next op repacks from activation_cache",
+    )
     return em
 
 
 def emit_add(node: Node, activation_cache: Dict[str, np.ndarray],
              tc: TileConfig) -> LayerEmission:
+    """Elementwise add. Element count must follow the **output** tensor (see ``_plan_add``), not
+    ``max(lhs.size, rhs.size)`` — the latter can stay at ``n_tokens * D`` when the FFN widens D."""
+    p = tc.params
+    out_shape = get_node_shape(node)
+    n_elem = int(p.get("total_elements", 0) or 0)
+    if n_elem <= 0 and out_shape:
+        n_elem = int(math.prod(out_shape))
     lhs = activation_cache.get(node.args[0].name) if isinstance(node.args[0], Node) else None
     rhs_arg = node.args[1]
     if isinstance(rhs_arg, Node) and rhs_arg.name in activation_cache:
@@ -631,16 +874,68 @@ def emit_add(node: Node, activation_cache: Dict[str, np.ndarray],
     if lhs is None:
         lhs = np.zeros_like(rhs)
 
-    total = max(lhs.size, rhs.size)
+    a = np.asarray(lhs, dtype=np.float32)
+    b = np.asarray(rhs, dtype=np.float32)
+    # (2048,) flat from upstream matmul must be (1, 32, 64) before broadcasting with
+    # a (64,) bias — otherwise (2048,) and (64,) are not broadcastable and we take a
+    # fragile ``np.resize`` path.
+    if out_shape and n_elem and int(n_elem) == int(math.prod(out_shape)):
+        sh = tuple(int(d) for d in out_shape)
+        if a.size == n_elem and a.shape != sh:
+            a = a.reshape(sh)
+        if b.size == n_elem and b.shape != sh:
+            b = b.reshape(sh)
+    try:
+        a, b = np.broadcast_arrays(a, b)
+    except ValueError:
+        a_flat = a.ravel()
+        b_flat = b.ravel()
+        if len(b_flat) < len(a_flat):
+            b_flat = np.resize(b_flat, a_flat.shape)
+        elif len(a_flat) < len(b_flat):
+            a_flat = np.resize(a_flat, b_flat.shape)
+    else:
+        a_flat = a.ravel()
+        b_flat = b.ravel()
+
+    if n_elem <= 0:
+        n_elem = max(int(a_flat.size), int(b_flat.size))
+    # Align to graph output size (e.g. 1×32×64) even if cache arrays were the wrong length.
+    if a_flat.size < n_elem:
+        t = np.zeros(n_elem, dtype=np.float32)
+        t[: a_flat.size] = a_flat
+        a_flat = t
+    else:
+        a_flat = a_flat[:n_elem]
+    if b_flat.size < n_elem:
+        t = np.zeros(n_elem, dtype=np.float32)
+        t[: b_flat.size] = b_flat
+        b_flat = t
+    else:
+        b_flat = b_flat[:n_elem]
+
+    total = n_elem
+    out_shape_resolved = out_shape if out_shape else (total,)
+    if p.get("use_numpy"):
+        em = LayerEmission()
+        em.skip_emulator = True
+        r = (a_flat + b_flat).astype(np.float32, copy=False)
+        em.numpy_result = r.reshape(out_shape_resolved)
+        em.output_shape = tuple(int(d) for d in out_shape_resolved)
+        em.output_elements = int(r.size)
+        em.layer_metrics = {
+            "map_kind": "add",
+            "map_rows": 0,
+            "map_width": 0,
+            "use_numpy": True,
+            "bytes_est_a": int(total * 2),
+            "bytes_est_b": int(total * 2),
+            "bytes_est_out": int(total * 2),
+        }
+        return em
+
     width = min(total, 32)
     rows = math.ceil(total / width)
-
-    a_flat = lhs.flatten()
-    b_flat = rhs.flatten()
-    if len(b_flat) < len(a_flat):
-        b_flat = np.resize(b_flat, a_flat.shape)
-    elif len(a_flat) < len(b_flat):
-        a_flat = np.resize(a_flat, b_flat.shape)
 
     A_GMEM = 0x1000
     B_GMEM = A_GMEM + _align_data(rows * width * 2)
@@ -653,20 +948,17 @@ def emit_add(node: Node, activation_cache: Dict[str, np.ndarray],
 
     padded_a = np.zeros(rows * width, dtype=np.float32)
     padded_b = np.zeros(rows * width, dtype=np.float32)
-    padded_a[:len(a_flat)] = a_flat[:total]
-    padded_b[:len(b_flat)] = b_flat[:total]
+    padded_a[: len(a_flat)] = a_flat
+    padded_b[: len(b_flat)] = b_flat
     for i in range(rows * width):
         img.bf16(A_GMEM + i * 2, float(padded_a[i]))
         img.bf16(B_GMEM + i * 2, float(padded_b[i]))
-
-    input_shape = get_node_shape(node)
-    out_shape = input_shape if input_shape else (total,)
 
     em = LayerEmission()
     em.c_source = _add_c(total, width)
     em.dram = img
     em.output_addr = C_GMEM
-    em.output_shape = out_shape
+    em.output_shape = out_shape_resolved
     em.output_elements = total
     em.layer_metrics = {
         "map_kind": "add",
@@ -846,7 +1138,9 @@ def emit_node(node: Node, gm: GraphModule,
     elif atalla_op == "add":
         return emit_add(node, activation_cache, tc)
     elif atalla_op == "mul":
-        return emit_mul(node, activation_cache)
+        return emit_mul(node, activation_cache, tc)
+    elif atalla_op == "atalla_sdpa":
+        return emit_sdpa(node, gm, activation_cache, tc)
     elif atalla_op == "layernorm":
         return emit_layernorm(node, gm, input_data, activation_cache, tc)
     elif atalla_op == "gelu":
@@ -856,7 +1150,9 @@ def emit_node(node: Node, gm: GraphModule,
 
 
 # ---------------------------------------------------------------------------
-# Compilation pipeline: .c -> ppci -> .s -> build_compiler.compile_asm -> .in
+# Compilation pipeline: .c -> ppci atalla_cc -> .s -> build_compiler.compile_asm -> .in
+# PPCI may emit 4-wide groups or linear asm; build_compiler.schedule_program produces
+# the final latency- and hazard-aware packets encoded into the .in instr section.
 # ---------------------------------------------------------------------------
 
 def compile_c(c_source: str, work_dir: str, tag: str) -> str:
@@ -885,8 +1181,9 @@ def compile_and_assemble(emission: LayerEmission, work_dir: str,
                          tag: str) -> str:
     """Compile C source (if present) or use pre-built instr_text.
 
-    Uses build_compiler.compile_asm() which handles notation conversion,
-    scheduling, and encoding - compatible with the updated ISA instruction formats.
+    Uses ``build_compiler.compile_asm()``: asm expansion, **``schedule_program``**
+    (latency + VLIW port/hazard rules), and encoding into the ``.in`` instruction
+    image — not packetization inside ``functional_sim.run``.
     """
     if emission.c_source:
         raw_s = compile_c(emission.c_source, work_dir, tag)

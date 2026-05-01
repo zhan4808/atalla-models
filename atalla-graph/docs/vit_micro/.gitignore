@@ -1,0 +1,6 @@
+# LaTeX build artifacts (optional — remove this file if you want to commit the PDF)
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz

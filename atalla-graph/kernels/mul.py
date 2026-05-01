@@ -1,11 +1,11 @@
-"""AtallaC add kernel: element-wise C = A + B on tiled data."""
+"""AtallaC element-wise multiply: C = A * B (BF16, same layout as add)."""
 
 import math
 from .common import ADDR_TABLE, TILE, sdma_ctl_expr, sdma_ctl_val
 
 
-def add_c(total: int, width: int = 32) -> str:
-    """Generate AtallaC for element-wise vector add."""
+def mul_c(total: int, width: int = 32) -> str:
+    """Generate AtallaC for element-wise vector multiply."""
     rows = math.ceil(total / width)
     w_m1 = width - 1
     sp_rows = min(rows, TILE)
@@ -25,6 +25,7 @@ def add_c(total: int, width: int = 32) -> str:
         '    asm("lw_s %0, 4(%1)" : "=r"(B_GMEM)  : "r"(cfg));\n'
         '    asm("lw_s %0, 8(%1)" : "=r"(C_GMEM)  : "r"(cfg));\n'
         "\n"
+        "    int sp = 0;\n"
         "    int all_mask = -1;\n"
         "    int ncols = 1;\n"
         f"{sdma_sp0}"
@@ -32,20 +33,19 @@ def add_c(total: int, width: int = 32) -> str:
         "\n"
         "    int tile = 0;\n"
         f"    while (tile < {tile_count}) {{\n"
-        "        /* Scratchpad id 0 (matches validated add_4x32.c — variable ``sp`` confused regalloc in multi-tile). */\n"
-        "        scpad_load(0, A_GMEM, sdma_ctl_sp0);\n"
-        "        scpad_load(0, B_GMEM, sdma_ctl_sp1);\n"
+        "        scpad_load(sp, A_GMEM, sdma_ctl_sp0);\n"
+        "        scpad_load(sp, B_GMEM, sdma_ctl_sp1);\n"
         "\n"
         "        int row = 0;\n"
         f"        while (row < {sp_rows}) {{\n"
-        f"            vec a = vector_load(0, row, {w_m1}, 0);\n"
-        f"            vec b = vector_load(0, row, {w_m1}, 1);\n"
-        '            vec c = vec_op_masked("+", a, b, all_mask);\n'
-        f"            vector_store(c, 0, row, {w_m1}, 0);\n"
+        f"            vec a = vector_load(sp, row, {w_m1}, 0);\n"
+        f"            vec b = vector_load(sp, row, {w_m1}, 1);\n"
+        '            vec c = vec_op_masked("*", a, b, all_mask);\n'
+        f"            vector_store(c, sp, row, {w_m1}, 0);\n"
         "            row = row + 1;\n"
         "        }\n"
         "\n"
-        "        scpad_store(0, C_GMEM, sdma_ctl_sp0);\n"
+        "        scpad_store(sp, C_GMEM, sdma_ctl_sp0);\n"
         f"        A_GMEM = A_GMEM + {tile_bytes};\n"
         f"        B_GMEM = B_GMEM + {tile_bytes};\n"
         f"        C_GMEM = C_GMEM + {tile_bytes};\n"
